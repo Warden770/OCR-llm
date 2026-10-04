@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import os
 import logging
+from pathlib import Path
 from typing import Generator
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
-load_dotenv()
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = BACKEND_DIR.parent
+load_dotenv(BACKEND_DIR / ".env")
+load_dotenv(PROJECT_ROOT / ".env")
 
 logger = logging.getLogger(__name__)
 

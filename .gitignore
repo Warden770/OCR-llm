@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
 *.pyo
@@ -8,7 +10,6 @@ __pycache__/
 .venv/
 .venv*/
 venv/
-.env
 node_modules/
 dist/
 frontend/node_modules/

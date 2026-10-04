@@ -127,7 +127,9 @@ class DocumentPreprocessor:
                     # rect[2] is angle in degrees in range [-90, 0)
                     rect_angle = rect[2]
                     # Convert to a conventional angle: positive means CCW
-                    if rect_angle < -45:
+                    if rect_angle > 45:
+                        rect_angle = rect_angle - 90
+                    elif rect_angle < -45:
                         rect_angle = rect_angle + 90
                     median_angle = float(-rect_angle)
                 else:

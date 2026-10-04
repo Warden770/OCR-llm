@@ -7,20 +7,25 @@ export const authRequired = ['1', 'true', 'yes', 'on'].includes(
 )
 
 export const supabase = supabaseUrl && supabasePublishableKey
-  ? createClient(supabaseUrl, supabasePublishableKey)
+  ? createClient(supabaseUrl, supabasePublishableKey, {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: true,
+      },
+    })
   : null
 
-const DEVICE_ID_STORAGE_KEY = 'ocr-device-id'
+let localSignOutPromise = null
 
-function getDeviceId() {
-  let deviceId = window.localStorage.getItem(DEVICE_ID_STORAGE_KEY)
-  if (!deviceId) {
-    deviceId = typeof crypto?.randomUUID === 'function'
-      ? crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(36).slice(2)}`
-    window.localStorage.setItem(DEVICE_ID_STORAGE_KEY, deviceId)
+async function clearStaleSession() {
+  if (!supabase || localSignOutPromise) {
+    return localSignOutPromise
   }
-  return deviceId
+  localSignOutPromise = supabase.auth.signOut({ scope: 'local' }).finally(() => {
+    localSignOutPromise = null
+  })
+  return localSignOutPromise
 }
 
 export async function getAccessToken() {
@@ -35,9 +40,17 @@ export async function authenticatedFetch(input, init = {}) {
     throw new Error('Please sign in to continue')
   }
   const headers = new Headers(init.headers || {})
-  headers.set('X-Device-ID', getDeviceId())
-  if (token) headers.set('Authorization', `Bearer ${token}`)
-  return window.fetch(input, { ...init, headers })
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`)
+  }
+  const response = await window.fetch(input, { ...init, headers })
+  if (response.status === 401 && authRequired && supabase) {
+    await clearStaleSession()
+  }
+  return response
 }
 
-export { getDeviceId }
+export async function signOut() {
+  if (!supabase) return { error: null }
+  return supabase.auth.signOut()
+}

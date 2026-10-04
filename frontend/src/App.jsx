@@ -2,38 +2,182 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import { renderAsync as renderDocx } from 'docx-preview'
-import { authRequired, authenticatedFetch, getAccessToken, getDeviceId, supabase } from './supabaseClient'
+import { authRequired, authenticatedFetch, getAccessToken, supabase } from './supabaseClient'
 
 const fetch = authenticatedFetch
 
-function AuthScreen({ onSignedIn }) {
+function AuthScreen({ onSignedIn, mode, onModeChange }) {
+  const isSignUp = mode === 'signup'
+  const [name, setName] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
-  async function signIn(event) {
+  function changeMode(nextMode) {
+    setShowPassword(false)
+    setShowConfirmPassword(false)
+    onModeChange(nextMode)
+  }
+
+  async function handleSubmit(event) {
     event.preventDefault()
     setBusy(true)
     setError('')
-    const { error: signInError } = await supabase.auth.signInWithPassword({ email, password })
-    if (signInError) setError(signInError.message)
-    else onSignedIn()
-    setBusy(false)
+
+    const normalizedName = String(name || '').trim()
+    const trimmedEmail = String(email || '').trim()
+    const normalizedEmail = trimmedEmail.toLowerCase()
+    if (isSignUp && normalizedName.length < 2) {
+      setError('Name must be at least 2 characters long.')
+      setBusy(false)
+      return
+    }
+    if (isSignUp && normalizedName.length > 100) {
+      setError('Name must be 100 characters or fewer.')
+      setBusy(false)
+      return
+    }
+    if (!normalizedEmail) {
+      setError('Email is required.')
+      setBusy(false)
+      return
+    }
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(normalizedEmail)) {
+      setError('Enter a valid email address.')
+      setBusy(false)
+      return
+    }
+    if (!password) {
+      setError('Password is required.')
+      setBusy(false)
+      return
+    }
+    if (isSignUp) {
+      if (!confirmPassword) {
+        setError('Please confirm your password.')
+        setBusy(false)
+        return
+      }
+      if (password !== confirmPassword) {
+        setError('Passwords do not match.')
+        setBusy(false)
+        return
+      }
+      if (password.length < 8) {
+        setError('Password must be at least 8 characters long.')
+        setBusy(false)
+        return
+      }
+      try {
+        const { data, error: signUpError } = await supabase.auth.signUp({
+          email: normalizedEmail,
+          password,
+          options: { data: { name: normalizedName } },
+        })
+        if (signUpError) {
+          setError(signUpError.message || 'Unable to create your account.')
+        } else if (data?.session) {
+          onSignedIn?.(normalizedName)
+        } else {
+          setError('Check your email to confirm your account before signing in.')
+        }
+      } catch {
+        setError('Unable to contact the authentication service. Please try again.')
+      } finally {
+        setBusy(false)
+      }
+      return
+    }
+
+    try {
+      const { error: signInError } = await supabase.auth.signInWithPassword({ email: normalizedEmail, password })
+      if (signInError) {
+        setError(signInError.message || 'Invalid email or password.')
+      } else {
+        onSignedIn?.()
+      }
+    } catch {
+      setError('Unable to contact the authentication service. Please try again.')
+    } finally {
+      setBusy(false)
+    }
   }
 
   return (
     <main className="flex min-h-screen items-center justify-center bg-slate-100 px-4">
-      <form onSubmit={signIn} className="w-full max-w-md space-y-5 rounded-2xl bg-white p-8 shadow-xl">
-        <div>
-          <h1 className="text-2xl font-semibold text-slate-900">Sign in to OCR Studio</h1>
-          <p className="mt-2 text-sm text-slate-500">Use your Supabase account to access your documents.</p>
+      <div className="w-full max-w-md space-y-5 rounded-2xl bg-white p-8 shadow-xl">
+        <div className="flex items-center gap-3">
+          <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-600 to-cyan-500 text-white shadow-sm">
+            <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="1.8">
+              <path d="M7 3h7l5 5v13H7z" />
+              <path d="M14 3v6h6" />
+            </svg>
+          </div>
+          <div>
+            <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">OCR system</div>
+            <h1 className="text-2xl font-semibold text-slate-900">{isSignUp ? 'Create account' : 'Sign in'}</h1>
+          </div>
         </div>
-        <input className="w-full rounded-xl border border-slate-200 px-4 py-3" type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="Email" required />
-        <input className="w-full rounded-xl border border-slate-200 px-4 py-3" type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Password" required />
-        {error && <p className="text-sm text-rose-600">{error}</p>}
-        <button className="w-full rounded-xl bg-slate-900 px-4 py-3 font-semibold text-white disabled:opacity-50" disabled={busy} type="submit">{busy ? 'Signing in...' : 'Sign in'}</button>
-      </form>
+
+        <p className="text-sm leading-6 text-slate-500">
+          Upload documents and extract text from a secure, account-backed workspace.
+        </p>
+
+        <div className="grid grid-cols-2 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-1">
+          <button type="button" onClick={() => changeMode('signin')} className={`rounded-lg px-3 py-2 text-sm font-semibold ${!isSignUp ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}>
+            Sign In
+          </button>
+          <button type="button" onClick={() => changeMode('signup')} className={`rounded-lg px-3 py-2 text-sm font-semibold ${isSignUp ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}>
+            Sign Up
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          {isSignUp ? (
+            <label className="block space-y-1.5 text-sm font-medium text-slate-700">
+              <span>Name</span>
+              <input className="w-full rounded-xl border border-slate-200 px-4 py-3 text-slate-900 outline-none transition focus:border-blue-400" type="text" value={name} onChange={(event) => setName(event.target.value)} autoComplete="name" maxLength={100} placeholder="Name" required />
+            </label>
+          ) : null}
+          <label className="block space-y-1.5 text-sm font-medium text-slate-700">
+            <span>Email</span>
+            <input className="w-full rounded-xl border border-slate-200 px-4 py-3 text-slate-900 outline-none transition focus:border-blue-400" type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" placeholder="Email" required />
+          </label>
+          <label className="block space-y-1.5 text-sm font-medium text-slate-700">
+            <span>Password</span>
+            <span className="flex gap-2">
+              <input className="min-w-0 flex-1 rounded-xl border border-slate-200 px-4 py-3 text-slate-900 outline-none transition focus:border-blue-400" type={showPassword ? 'text' : 'password'} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={isSignUp ? 'new-password' : 'current-password'} placeholder="Password" required />
+              <button type="button" aria-label={showPassword ? 'Hide password' : 'Show password'} aria-pressed={showPassword} onClick={() => setShowPassword((visible) => !visible)} className="rounded-xl border border-slate-200 px-3 text-sm text-slate-600">{showPassword ? 'Hide' : 'Show'}</button>
+            </span>
+          </label>
+          {isSignUp ? (
+            <label className="block space-y-1.5 text-sm font-medium text-slate-700">
+              <span>Confirm Password</span>
+              <span className="flex gap-2">
+                <input className="min-w-0 flex-1 rounded-xl border border-slate-200 px-4 py-3 text-slate-900 outline-none transition focus:border-blue-400" type={showConfirmPassword ? 'text' : 'password'} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="Confirm password" required />
+                <button type="button" aria-label={showConfirmPassword ? 'Hide confirm password' : 'Show confirm password'} aria-pressed={showConfirmPassword} onClick={() => setShowConfirmPassword((visible) => !visible)} className="rounded-xl border border-slate-200 px-3 text-sm text-slate-600">{showConfirmPassword ? 'Hide' : 'Show'}</button>
+              </span>
+            </label>
+          ) : null}
+          {error ? <p className="text-sm text-rose-600">{error}</p> : null}
+          <button className="w-full rounded-xl bg-slate-900 px-4 py-3 font-semibold text-white disabled:opacity-50" disabled={busy} type="submit">
+            {busy ? (isSignUp ? 'Creating account...' : 'Signing in...') : (isSignUp ? 'Create Account' : 'Sign In')}
+          </button>
+        </form>
+
+        {!isSignUp ? (
+          <p className="text-center text-sm text-slate-500">
+            Don&apos;t have an account?{' '}
+            <button type="button" onClick={() => changeMode('signup')} className="font-semibold text-blue-700 hover:underline">
+              Create account
+            </button>
+          </p>
+        ) : null}
+      </div>
     </main>
   )
 }
@@ -58,6 +202,138 @@ function AuthConfigurationScreen() {
           Reload
         </button>
       </section>
+    </main>
+  )
+}
+
+function ProfilePage({ name, userEmail, createdAt, onSaveName, onBackToLibrary, onSignOut }) {
+  const [editing, setEditing] = useState(false)
+  const [draftName, setDraftName] = useState(name)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => setDraftName(name), [name])
+
+  async function handleSave(event) {
+    event.preventDefault()
+    const normalizedName = draftName.trim()
+    if (normalizedName.length < 2 || normalizedName.length > 100) {
+      setError('Name must be between 2 and 100 characters.')
+      return
+    }
+    setBusy(true)
+    setError('')
+    try {
+      await onSaveName(normalizedName)
+      setEditing(false)
+    } catch (saveError) {
+      setError(saveError.message || 'Unable to save your profile.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <main className="mx-auto max-w-4xl px-4 pb-10 pt-8">
+      <div className="rounded-[30px] border border-slate-200 bg-white p-8 shadow-[0_10px_30px_rgba(15,23,42,0.05)]">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Profile</p>
+            <h1 className="mt-2 text-3xl font-semibold text-slate-900">Your account</h1>
+          </div>
+          <button type="button" onClick={onBackToLibrary} className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+            Back to library
+          </button>
+        </div>
+
+        <div className="mt-8 grid gap-4 sm:grid-cols-2">
+          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+            <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Name</div>
+            <div className="mt-2 text-lg font-semibold text-slate-900">{name}</div>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+            <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Email</div>
+            <div className="mt-2 text-lg font-semibold text-slate-900">{userEmail || 'Unknown user'}</div>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+            <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Account created</div>
+            <div className="mt-2 text-lg font-semibold text-slate-900">{createdAt ? formatDate(createdAt) : 'Not available'}</div>
+          </div>
+        </div>
+
+        {editing ? (
+          <form onSubmit={handleSave} className="mt-6 space-y-3">
+            <label className="block space-y-1.5 text-sm font-medium text-slate-700">
+              <span>Name</span>
+              <input autoFocus maxLength={100} value={draftName} onChange={(event) => setDraftName(event.target.value)} className="w-full rounded-xl border border-slate-200 px-4 py-3 text-slate-900 outline-none focus:border-blue-400" required />
+            </label>
+            {error ? <p role="alert" className="text-sm text-rose-600">{error}</p> : null}
+            <div className="flex gap-3">
+              <button disabled={busy} className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white disabled:opacity-50">{busy ? 'Saving...' : 'Save Name'}</button>
+              <button type="button" onClick={() => { setEditing(false); setDraftName(name); setError('') }} className="rounded-full border border-slate-200 px-5 py-3 text-sm font-semibold text-slate-700">Cancel</button>
+            </div>
+          </form>
+        ) : null}
+
+        <div className="mt-8 flex flex-wrap gap-3">
+          {!editing ? (
+            <button type="button" onClick={() => setEditing(true)} className="rounded-full border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+              Edit Profile
+            </button>
+          ) : null}
+          <button type="button" onClick={onSignOut} className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white hover:bg-slate-800">
+            Sign out
+          </button>
+        </div>
+      </div>
+    </main>
+  )
+}
+
+function CompleteProfilePage({ initialName, error, onSubmit, onSignOut }) {
+  const [name, setName] = useState(initialName)
+  const [busy, setBusy] = useState(false)
+  const [validationError, setValidationError] = useState('')
+
+  useEffect(() => setName(initialName), [initialName])
+
+  async function handleSubmit(event) {
+    event.preventDefault()
+    const normalizedName = name.trim()
+    if (normalizedName.length < 2 || normalizedName.length > 100) {
+      setValidationError('Name must be between 2 and 100 characters.')
+      return
+    }
+    setBusy(true)
+    setValidationError('')
+    try {
+      await onSubmit(normalizedName)
+    } catch (submitError) {
+      setValidationError(submitError.message || 'Unable to save your profile.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <main className="flex min-h-screen items-center justify-center bg-slate-100 px-4">
+      <form onSubmit={handleSubmit} className="w-full max-w-md space-y-5 rounded-2xl bg-white p-8 shadow-xl">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Profile</p>
+          <h1 className="mt-2 text-2xl font-semibold text-slate-900">Complete Your Profile</h1>
+        </div>
+        <label className="block space-y-1.5 text-sm font-medium text-slate-700">
+          <span>Name</span>
+          <input autoFocus maxLength={100} value={name} onChange={(event) => setName(event.target.value)} className="w-full rounded-xl border border-slate-200 px-4 py-3 text-slate-900 outline-none focus:border-blue-400" required />
+        </label>
+        {validationError || error ? <p role="alert" className="text-sm text-rose-600">{validationError || error}</p> : null}
+        <button disabled={busy} className="w-full rounded-xl bg-slate-900 px-4 py-3 font-semibold text-white disabled:opacity-50">
+          {busy ? 'Saving...' : 'Continue'}
+        </button>
+        <button type="button" onClick={onSignOut} className="w-full rounded-xl border border-slate-200 px-4 py-3 font-semibold text-slate-700">
+          Sign Out
+        </button>
+      </form>
     </main>
   )
 }
@@ -136,6 +412,7 @@ function statusTone(status) {
 }
 
 function pageTitle(page, documentData) {
+  if (page === 'profile') return 'Profile'
   if (page === 'processing') return 'Processing Document'
   if (page === 'viewer') {
     return documentData ? `Reviewing ${documentData.name}` : 'Document Viewer'
@@ -238,29 +515,85 @@ function resolveApiAssetUrl(path, apiBaseUrl) {
   }
   const base = String(apiBaseUrl || '').replace(/\/+$/, '')
   const normalizedPath = path.startsWith('/') ? path : `/${path}`
-  const separator = normalizedPath.includes('?') ? '&' : '?'
-  return `${base}${normalizedPath}${separator}device_id=${encodeURIComponent(getDeviceId())}`
+  return `${base}${normalizedPath}`
+}
+
+function AuthenticatedPageImage({ src, alt, className, children }) {
+  const [imageUrl, setImageUrl] = useState('')
+  const [loadFailed, setLoadFailed] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    let objectUrl = ''
+    setImageUrl('')
+    setLoadFailed(false)
+
+    async function loadImage() {
+      try {
+        const response = await authenticatedFetch(src)
+        if (!response.ok) {
+          throw new Error('Page image request failed')
+        }
+        const blob = await response.blob()
+        const nextObjectUrl = URL.createObjectURL(blob)
+        if (!active) {
+          URL.revokeObjectURL(nextObjectUrl)
+          return
+        }
+        objectUrl = nextObjectUrl
+        setImageUrl(objectUrl)
+      } catch {
+        if (active) setLoadFailed(true)
+      }
+    }
+
+    void loadImage()
+    return () => {
+      active = false
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [src])
+
+  if (loadFailed) {
+    return (
+      <div className="flex min-h-[480px] w-full items-center justify-center rounded-xl border border-dashed border-slate-300 bg-white text-sm text-slate-500">
+        Source page preview is unavailable.
+      </div>
+    )
+  }
+
+  if (!imageUrl) {
+    return (
+      <div role="status" className="flex min-h-[480px] w-full items-center justify-center rounded-xl border border-slate-200 bg-white text-sm text-slate-500">
+        Loading source page...
+      </div>
+    )
+  }
+
+  return (
+    <>
+      <img src={imageUrl} alt={alt} className={className} draggable="false" />
+      {children}
+    </>
+  )
 }
 
 function LoadingSkeleton({ className = '' }) {
   return <div className={`skeleton rounded-2xl ${className}`} />
 }
-
 function EffectRegister({ popupRef, onClose }) {
   useEffect(() => {
-    function handleMouseDown(e) {
+    function handleMouseDown(event) {
       try {
         if (!popupRef?.current) return
-        if (!popupRef.current.contains(e.target)) {
-          onClose()
-        }
-      } catch (err) {
-        // ignore
+        if (!popupRef.current.contains(event.target)) onClose()
+      } catch {
+        // Ignore detached popup references during unmount.
       }
     }
 
-    function handleKey(e) {
-      if (e.key === 'Escape') onClose()
+    function handleKey(event) {
+      if (event.key === 'Escape') onClose()
     }
 
     document.addEventListener('mousedown', handleMouseDown)
@@ -274,11 +607,12 @@ function EffectRegister({ popupRef, onClose }) {
   return null
 }
 
-function TopBar({ pageLabel, documentData, onNavigateLanding, searchQuery, setSearchQuery, searchMode, setSearchMode, onRefresh, serverResults, serverPopupOpen, onCloseSearchResults, onSelectSearchResult }) {
+function TopBar({ pageLabel, documentData, onNavigateLanding, searchQuery, setSearchQuery, searchMode, setSearchMode, onRefresh, serverResults, serverPopupOpen, onCloseSearchResults, onSelectSearchResult, userEmail, onOpenProfile, onSignOut }) {
   const searchPopupRef = useRef(null)
 
   return (
     <header className="sticky top-0 z-30 border-b border-slate-200/80 bg-white/95 backdrop-blur-xl">
+      <EffectRegister popupRef={searchPopupRef} onClose={onCloseSearchResults} />
       <div className="mx-auto flex max-w-[1600px] flex-col gap-3 px-4 py-3 sm:px-6 lg:flex-row lg:items-center lg:justify-between lg:px-8 lg:py-4">
         <button type="button" onClick={onNavigateLanding} className="flex min-w-0 items-center gap-3 text-left">
           <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-slate-200 bg-gradient-to-br from-blue-600 to-cyan-500 text-white shadow-sm">
@@ -295,32 +629,21 @@ function TopBar({ pageLabel, documentData, onNavigateLanding, searchQuery, setSe
 
         <div className="flex shrink-0 items-center justify-end gap-2 sm:gap-3">
           {pageLabel === 'Document Dashboard' ? (
-            <div className="relative flex max-w-full items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2">
-              <select value={searchMode} onChange={(e) => setSearchMode?.(e.target.value)} className="rounded-md border bg-white px-2 py-1 text-sm">
+            <div ref={searchPopupRef} className="relative flex max-w-full items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2">
+              <select value={searchMode} onChange={(event) => setSearchMode?.(event.target.value)} className="rounded-md border bg-white px-2 py-1 text-sm">
                 <option value="documents">Docs</option>
                 <option value="attributes">Attrs</option>
               </select>
-              <input
-                type="search"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery?.(e.target.value)}
-                placeholder={searchMode === 'documents' ? 'Search documents' : 'Search attributes'}
-                className="w-32 bg-transparent text-sm text-slate-900 outline-none placeholder:text-slate-400 sm:w-48 lg:w-72"
-              />
+              <input type="search" value={searchQuery} onChange={(event) => setSearchQuery?.(event.target.value)} placeholder={searchMode === 'documents' ? 'Search documents' : 'Search attributes'} className="w-32 bg-transparent text-sm text-slate-900 outline-none placeholder:text-slate-400 sm:w-48 lg:w-72" />
               {serverPopupOpen && serverResults?.length ? (
-                <div ref={searchPopupRef} className="absolute right-0 top-full z-50 mt-2 w-[min(720px,calc(100vw-2rem))] overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl">
+                <div className="absolute right-0 top-full z-50 mt-2 w-[min(720px,calc(100vw-2rem))] overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl">
                   <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3 text-sm font-semibold">
                     <span>Search results</span>
                     <button type="button" title="Close" onClick={onCloseSearchResults} className="rounded px-2 py-1 text-sm text-slate-500 hover:bg-slate-50">✕</button>
                   </div>
                   <div className="max-h-80 overflow-auto">
                     {serverResults.slice(0, 8).map((item) => (
-                      <button
-                        type="button"
-                        key={`${item.document_id || item.id}-${item.id}`}
-                        onClick={() => onSelectSearchResult(item)}
-                        className="block w-full border-b px-4 py-3 text-left hover:bg-slate-50"
-                      >
+                      <button type="button" key={`${item.document_id || item.id}-${item.id}`} onClick={() => onSelectSearchResult(item)} className="block w-full border-b px-4 py-3 text-left hover:bg-slate-50">
                         <div className="flex items-center justify-between">
                           <div className="text-sm font-medium text-slate-900">{item.entity_type_label || item.name}</div>
                           <div className="text-xs text-slate-500">{item.document_id ? `Doc ${item.document_id}` : item.timestamp ? new Date(item.timestamp).toLocaleDateString() : ''}</div>
@@ -334,14 +657,15 @@ function TopBar({ pageLabel, documentData, onNavigateLanding, searchQuery, setSe
             </div>
           ) : documentData ? (
             <>
-              <button type="button" onClick={onNavigateLanding} className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-600 transition hover:bg-slate-50">
-                Back
-              </button>
-              <button type="button" onClick={() => onRefresh?.()} className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-600 transition hover:bg-slate-50">
-                Refresh
-              </button>
+              <button type="button" onClick={onNavigateLanding} className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-600 transition hover:bg-slate-50">Back</button>
+              <button type="button" onClick={() => onRefresh?.()} className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm text-slate-600 transition hover:bg-slate-50">Refresh</button>
             </>
           ) : null}
+
+          <button type="button" onClick={onOpenProfile} className="rounded-full border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
+            {userEmail ? userEmail.split('@')[0] : 'Profile'}
+          </button>
+          <button type="button" onClick={onSignOut} className="rounded-full bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800">Sign out</button>
         </div>
       </div>
     </header>
@@ -392,10 +716,8 @@ function LandingPage({
         if (!active) return
         setDocTypes(dtJson.document_types || [])
         setAttributeNames(anJson.attribute_names || [])
-      } catch (e) {
-        if (active && attempt < 10) {
-          retryTimer = window.setTimeout(() => loadOptions(attempt + 1), 1500)
-        }
+      } catch {
+        if (active && attempt < 10) retryTimer = window.setTimeout(() => loadOptions(attempt + 1), 1500)
       }
     }
     loadOptions()
@@ -405,26 +727,15 @@ function LandingPage({
     }
   }, [apiBaseUrl])
 
-  // Poll for new documents while on the landing page so recent history updates
-  // automatically during testing/dev.
   useEffect(() => {
     const interval = setInterval(() => {
-      if (page === 'landing') {
-        void refreshDocuments().catch(() => {})
-      }
+      if (page === 'landing') void refreshDocuments().catch(() => {})
     }, 15000)
     return () => clearInterval(interval)
   }, [page, apiBaseUrl])
 
-  // debounce search + filters
   useEffect(() => {
-    const requestKey = JSON.stringify({
-      query: searchQuery.trim().toLowerCase(),
-      mode: searchMode,
-      page,
-      pageSize,
-      filters,
-    })
+    const requestKey = JSON.stringify({ query: searchQuery.trim().toLowerCase(), mode: searchMode, page, pageSize, filters })
     const hasSearchCriteria = Boolean(searchQuery.trim() || Object.values(filters).some(Boolean))
     if (!hasSearchCriteria) {
       onServerResults?.({ results: [], total: 0, mode: searchMode, q: '', requestKey })
@@ -432,22 +743,21 @@ function LandingPage({
     }
 
     onServerResults?.({ results: [], total: 0, mode: searchMode, q: searchQuery, loading: true, requestKey })
-
     const timeout = setTimeout(() => {
       async function doSearch() {
         try {
           const params = new URLSearchParams()
           if (searchQuery) params.set('q', searchQuery)
-          if (page) params.set('page', String(page))
-          if (pageSize) params.set('page_size', String(pageSize))
+          params.set('page', String(page))
+          params.set('page_size', String(pageSize))
           if (searchMode === 'documents') {
             if (filters.document_type) params.set('document_type', filters.document_type)
             if (filters.status) params.set('status', filters.status)
             if (filters.start_date) params.set('start_date', filters.start_date)
             if (filters.end_date) params.set('end_date', filters.end_date)
-            const resp = await fetch(`${apiBaseUrl}/api/v1/search/documents?${params.toString()}`)
-            const data = await resp.json()
-            if (!resp.ok) throw new Error(data.detail || 'Search failed')
+            const response = await fetch(`${apiBaseUrl}/api/v1/search/documents?${params}`)
+            const data = await response.json()
+            if (!response.ok) throw new Error(data.detail || 'Search failed')
             onServerResults?.({ results: data.documents || [], total: data.total || 0, mode: 'documents', q: searchQuery, requestKey })
           } else {
             if (filters.attribute_name) params.set('attribute_name', filters.attribute_name)
@@ -455,26 +765,21 @@ function LandingPage({
             if (filters.max_conf) params.set('max_conf', filters.max_conf)
             if (filters.document_type) params.set('document_type', filters.document_type)
             if (filters.hitl_corrected) params.set('hitl_corrected', filters.hitl_corrected)
-            const resp = await fetch(`${apiBaseUrl}/api/v1/search/attributes?${params.toString()}`)
-            const data = await resp.json()
-            if (!resp.ok) throw new Error(data.detail || 'Search failed')
+            const response = await fetch(`${apiBaseUrl}/api/v1/search/attributes?${params}`)
+            const data = await response.json()
+            if (!response.ok) throw new Error(data.detail || 'Search failed')
             onServerResults?.({ results: data.attributes || [], total: data.total || 0, mode: 'attributes', q: searchQuery, requestKey })
           }
-        } catch (err) {
-          onServerResults?.({ results: [], total: 0, mode: searchMode, q: searchQuery, error: err.message, requestKey })
+        } catch (error) {
+          onServerResults?.({ results: [], total: 0, mode: searchMode, q: searchQuery, error: error.message, requestKey })
         }
       }
-      doSearch()
+      void doSearch()
     }, 350)
+    return () => clearTimeout(timeout)
+  }, [searchQuery, page, pageSize, searchMode, filters, apiBaseUrl])
 
-      return () => clearTimeout(timeout)
-    }, [searchQuery, page, pageSize, searchMode, filters, apiBaseUrl])
-
-
-  // reset to first page when search query or mode changes
-  useEffect(() => {
-    setPage(1)
-  }, [searchQuery, searchMode])
+  useEffect(() => setPage(1), [searchQuery, searchMode])
 
   const handleFileSelected = (event) => {
     const file = event.target.files?.[0]
@@ -1216,11 +1521,10 @@ function ViewerPage({
                     <div className="overflow-auto rounded-2xl border border-slate-200 bg-slate-100 p-3">
                       <div className="relative mx-auto" style={{ width: `${zoom}%`, minWidth: '680px' }}>
                         {page.image_url ? (
-                          <img
+                          <AuthenticatedPageImage
                             src={resolveApiAssetUrl(page.image_url, apiBaseUrl)}
                             alt={`Source page ${page.page_number}`}
                             className="block w-full rounded-xl border border-slate-200 bg-white"
-                            draggable="false"
                           />
                         ) : (
                           <div className="flex min-h-[480px] w-full items-center justify-center rounded-xl border border-dashed border-slate-300 bg-white text-sm text-slate-500">
@@ -1692,12 +1996,109 @@ export default function App() {
   const originBase = typeof window !== 'undefined' ? `${window.location.protocol}//${window.location.hostname}` : ''
   const apiBaseUrl = envBase || (originBase ? `${originBase}:${defaultPort}` : `http://localhost:${defaultPort}`)
   const [session, setSession] = useState(null)
+  const [sessionLoading, setSessionLoading] = useState(true)
+  const [authMode, setAuthMode] = useState('signin')
+  const [profileOpen, setProfileOpen] = useState(false)
+  const [profile, setProfile] = useState(null)
+  const [profileName, setProfileName] = useState('')
+  const [profileUserId, setProfileUserId] = useState(null)
+  const [profileLoading, setProfileLoading] = useState(false)
+  const [profileError, setProfileError] = useState('')
+  const [profileReloadKey, setProfileReloadKey] = useState(0)
   useEffect(() => {
-    if (!supabase) return undefined
-    supabase.auth.getSession().then(({ data }) => setSession(data.session))
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => setSession(nextSession))
-    return () => listener.subscription.unsubscribe()
+    if (!supabase) {
+      setSessionLoading(false)
+      return undefined
+    }
+    let active = true
+    supabase.auth.getSession().then(({ data }) => {
+      if (active) setSession(data.session)
+    }).catch(() => {
+      if (active) setSession(null)
+    }).finally(() => {
+      if (active) setSessionLoading(false)
+    })
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession)
+      setSessionLoading(false)
+      if (!nextSession) {
+        setProfileOpen(false)
+        setProfile(null)
+        setProfileName('')
+        setProfileUserId(null)
+        setProfileError('')
+        setPage('landing')
+        setActiveDocumentId(null)
+        setActiveAttributeId(null)
+        setDocuments([])
+        setViewerBundle(null)
+        setSavedAttributes([])
+        setCurrentAttribute(null)
+        setAttributeDetail(null)
+        setServerResults([])
+        setServerTotal(0)
+      }
+    })
+    return () => {
+      active = false
+      listener.subscription.unsubscribe()
+    }
   }, [])
+  const currentUserEmail = session?.user?.email || null
+  const createdAt = session?.user?.created_at || null
+  async function saveProfileName(name) {
+    const response = await fetch(`${apiBaseUrl}/api/v1/profile`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.detail || 'Unable to save your profile.')
+    setProfile(result.profile)
+    setProfileName(result.profile.name)
+    setProfileUserId(result.profile.user_id)
+    setProfileError('')
+  }
+
+  useEffect(() => {
+    if (!supabase || !session?.user?.id) {
+      setProfile(null)
+      setProfileName('')
+      setProfileUserId(null)
+      setProfileLoading(false)
+      return undefined
+    }
+
+    let active = true
+    setProfileLoading(true)
+    setProfileUserId(null)
+    setProfileError('')
+    async function loadProfile() {
+      try {
+        const response = await fetch(`${apiBaseUrl}/api/v1/profile`)
+        const result = await response.json()
+        if (!response.ok) throw new Error(result.detail || 'Unable to load your profile.')
+        if (!active) return
+        setProfile(result.profile)
+        setProfileName(result.profile?.name || String(session.user.user_metadata?.name || '').trim())
+      } catch (error) {
+        if (active) {
+          setProfile(null)
+          setProfileError(error.message || 'Unable to load your profile.')
+        }
+      } finally {
+        if (active) {
+          setProfileUserId(session.user.id)
+          setProfileLoading(false)
+        }
+      }
+    }
+    void loadProfile()
+    return () => {
+      active = false
+    }
+  }, [session, apiBaseUrl, profileReloadKey])
+
   const initialRoute = useMemo(() => parseInitialRoute(), [])
   const [page, setPage] = useState(initialRoute.page)
   const [activeDocumentId, setActiveDocumentId] = useState(initialRoute.documentId)
@@ -2246,7 +2647,6 @@ export default function App() {
         const formData = new FormData()
         formData.append('file', file)
         getAccessToken().then((token) => {
-          xhr.setRequestHeader('X-Device-ID', getDeviceId())
           if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
           xhr.send(formData)
         }).catch(reject)
@@ -2587,8 +2987,91 @@ export default function App() {
     return <AuthConfigurationScreen />
   }
 
+  if (authRequired && supabase && sessionLoading) {
+    return <main role="status" className="flex min-h-screen items-center justify-center text-sm text-slate-500">Restoring your session...</main>
+  }
+
   if (authRequired && supabase && !session) {
-    return <AuthScreen onSignedIn={() => supabase.auth.getSession().then(({ data }) => setSession(data.session))} />
+    return (
+      <AuthScreen
+        mode={authMode}
+        onModeChange={setAuthMode}
+        onSignedIn={async (signupName) => {
+          const { data } = await supabase.auth.getSession()
+          setSession(data.session)
+          setSessionLoading(false)
+          if (signupName && data.session) await saveProfileName(signupName)
+        }}
+      />
+    )
+  }
+
+  if (authRequired && supabase && session && profileUserId !== session.user.id) {
+    return <main role="status" className="flex min-h-screen items-center justify-center text-sm text-slate-500">Loading your profile...</main>
+  }
+
+  if (authRequired && supabase && session && !profile) {
+    return (
+      <CompleteProfilePage
+        initialName={profileName}
+        error={profileError}
+        onSubmit={saveProfileName}
+        onSignOut={async () => {
+          await supabase.auth.signOut({ scope: 'local' })
+        }}
+      />
+    )
+  }
+
+  if (profileOpen) {
+    return (
+      <div className="min-h-screen bg-white text-slate-900">
+        <TopBar
+          pageLabel="Profile"
+          documentData={null}
+          onNavigateLanding={() => {
+            setProfileOpen(false)
+            setPage('landing')
+          }}
+          onNavigateViewer={() => setPage('landing')}
+          searchQuery={searchQuery}
+          setSearchQuery={handleSetSearchQuery}
+          searchMode={searchMode}
+          setSearchMode={setSearchMode}
+          onRefresh={() => {}}
+          serverResults={serverResults}
+          serverPopupOpen={serverPopupOpen}
+          onCloseSearchResults={() => setServerPopupOpen(false)}
+          onSelectSearchResult={handleSelectSearchResult}
+          userEmail={currentUserEmail}
+          onOpenProfile={() => setProfileOpen(true)}
+          onSignOut={async () => {
+            if (!supabase) return
+            await supabase.auth.signOut()
+            setSession(null)
+            setProfileOpen(false)
+            setPage('landing')
+          }}
+        />
+        <ProfilePage
+          name={profile?.name || profileName || 'Name not set'}
+          userEmail={currentUserEmail}
+          createdAt={createdAt}
+          onSaveName={saveProfileName}
+          onBackToLibrary={() => {
+            setProfileOpen(false)
+            setPage('landing')
+          }}
+          onSignOut={async () => {
+            if (!supabase) return
+            await supabase.auth.signOut()
+            setSession(null)
+            setProfileOpen(false)
+            setPage('landing')
+          }}
+        />
+      </div>
+    )
   }
 
   return (
@@ -2609,6 +3092,15 @@ export default function App() {
         serverPopupOpen={serverPopupOpen}
         onCloseSearchResults={() => setServerPopupOpen(false)}
         onSelectSearchResult={handleSelectSearchResult}
+        userEmail={currentUserEmail}
+        onOpenProfile={() => setProfileOpen(true)}
+        onSignOut={async () => {
+          if (!supabase) return
+          await supabase.auth.signOut()
+          setSession(null)
+          setProfileOpen(false)
+          setPage('landing')
+        }}
       />
 
       {/* Saved toast */}

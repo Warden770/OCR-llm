@@ -9,6 +9,7 @@ from app.attributes_api import router as attributes_router
 from app.ingestion_pipeline import router as ingestion_router
 from app.debug_api import router as debug_router
 from app.search_api import router as search_router
+from app.profiles_api import router as profiles_router
 
 app = FastAPI(
     title="OCR Attribute Extraction API",
@@ -63,6 +64,7 @@ app.add_middleware(
 
 app.include_router(ingestion_router, prefix="/api/v1", tags=["ingestion"])
 app.include_router(attributes_router, prefix="/api/v1", tags=["attributes"])
+app.include_router(profiles_router, prefix="/api/v1", tags=["profiles"])
 debug_enabled = os.getenv("ENABLE_DEBUG_ENDPOINTS", "false").strip().lower() in {"1", "true", "yes", "on"}
 debug_environment = os.getenv("ENV", "").strip().lower() in {"development", "dev", "test"}
 if debug_enabled and debug_environment:

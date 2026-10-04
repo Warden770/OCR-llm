@@ -23,4 +23,5 @@ alembic==1.13.2
 pytest==7.4.0
 seqeval==1.2.2
 PyJWT[crypto]==2.10.1
+httpx==0.28.1
 supabase==2.15.0

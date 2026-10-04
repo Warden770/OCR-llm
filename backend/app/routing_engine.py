@@ -240,8 +240,6 @@ def cluster_entity_tokens(token_predictions: Sequence[Dict[str, Any]], threshold
             if index:
                 if paragraph_num != previous_paragraph:
                     value_parts.append("\n\n")
-                elif line_num != previous_line:
-                    value_parts.append("\n")
                 else:
                     value_parts.append(" ")
             value_parts.append(token)
