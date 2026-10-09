@@ -3,7 +3,7 @@ import { createClient } from '@supabase/supabase-js'
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
 const supabasePublishableKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY || import.meta.env.VITE_SUPABASE_ANON_KEY
 export const authRequired = ['1', 'true', 'yes', 'on'].includes(
-  String(import.meta.env.VITE_AUTH_REQUIRED || 'false').trim().toLowerCase(),
+  String(import.meta.env.VITE_AUTH_REQUIRED || 'true').trim().toLowerCase(),
 )
 
 export const supabase = supabaseUrl && supabasePublishableKey

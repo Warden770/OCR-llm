@@ -108,75 +108,273 @@ function AuthScreen({ onSignedIn, mode, onModeChange }) {
   }
 
   return (
-    <main className="flex min-h-screen items-center justify-center bg-slate-100 px-4">
-      <div className="w-full max-w-md space-y-5 rounded-2xl bg-white p-8 shadow-xl">
-        <div className="flex items-center gap-3">
-          <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-600 to-cyan-500 text-white shadow-sm">
-            <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth="1.8">
-              <path d="M7 3h7l5 5v13H7z" />
-              <path d="M14 3v6h6" />
-            </svg>
+    <main className="auth-root">
+      {/* ── LEFT: form panel ── */}
+      <div className="auth-form-panel">
+        <div className="auth-card page-fade-in">
+          {/* Logo */}
+          <div className="auth-logo">
+            <div className="auth-logo-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+                <path d="M7 3h7l5 5v13H7z" />
+                <path d="M14 3v6h6" />
+                <path d="M10 12h5M10 15.5h3" strokeLinecap="round" />
+              </svg>
+            </div>
+            <div>
+              <div className="auth-logo-label">OCR System</div>
+            </div>
           </div>
-          <div>
-            <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">OCR system</div>
-            <h1 className="text-2xl font-semibold text-slate-900">{isSignUp ? 'Create account' : 'Sign in'}</h1>
+
+          {/* Headline */}
+          <div className="auth-headline">
+            <h1 className="auth-title">{isSignUp ? 'Create account' : 'Welcome back'}</h1>
+            <p className="auth-subtitle">
+              {isSignUp
+                ? 'Start extracting text from your documents.'
+                : 'Sign in to your secure workspace.'}
+            </p>
           </div>
-        </div>
 
-        <p className="text-sm leading-6 text-slate-500">
-          Upload documents and extract text from a secure, account-backed workspace.
-        </p>
-
-        <div className="grid grid-cols-2 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-1">
-          <button type="button" onClick={() => changeMode('signin')} className={`rounded-lg px-3 py-2 text-sm font-semibold ${!isSignUp ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}>
-            Sign In
-          </button>
-          <button type="button" onClick={() => changeMode('signup')} className={`rounded-lg px-3 py-2 text-sm font-semibold ${isSignUp ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'}`}>
-            Sign Up
-          </button>
-        </div>
-
-        <form onSubmit={handleSubmit} className="space-y-4">
-          {isSignUp ? (
-            <label className="block space-y-1.5 text-sm font-medium text-slate-700">
-              <span>Name</span>
-              <input className="w-full rounded-xl border border-slate-200 px-4 py-3 text-slate-900 outline-none transition focus:border-blue-400" type="text" value={name} onChange={(event) => setName(event.target.value)} autoComplete="name" maxLength={100} placeholder="Name" required />
-            </label>
-          ) : null}
-          <label className="block space-y-1.5 text-sm font-medium text-slate-700">
-            <span>Email</span>
-            <input className="w-full rounded-xl border border-slate-200 px-4 py-3 text-slate-900 outline-none transition focus:border-blue-400" type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" placeholder="Email" required />
-          </label>
-          <label className="block space-y-1.5 text-sm font-medium text-slate-700">
-            <span>Password</span>
-            <span className="flex gap-2">
-              <input className="min-w-0 flex-1 rounded-xl border border-slate-200 px-4 py-3 text-slate-900 outline-none transition focus:border-blue-400" type={showPassword ? 'text' : 'password'} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={isSignUp ? 'new-password' : 'current-password'} placeholder="Password" required />
-              <button type="button" aria-label={showPassword ? 'Hide password' : 'Show password'} aria-pressed={showPassword} onClick={() => setShowPassword((visible) => !visible)} className="rounded-xl border border-slate-200 px-3 text-sm text-slate-600">{showPassword ? 'Hide' : 'Show'}</button>
-            </span>
-          </label>
-          {isSignUp ? (
-            <label className="block space-y-1.5 text-sm font-medium text-slate-700">
-              <span>Confirm Password</span>
-              <span className="flex gap-2">
-                <input className="min-w-0 flex-1 rounded-xl border border-slate-200 px-4 py-3 text-slate-900 outline-none transition focus:border-blue-400" type={showConfirmPassword ? 'text' : 'password'} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="Confirm password" required />
-                <button type="button" aria-label={showConfirmPassword ? 'Hide confirm password' : 'Show confirm password'} aria-pressed={showConfirmPassword} onClick={() => setShowConfirmPassword((visible) => !visible)} className="rounded-xl border border-slate-200 px-3 text-sm text-slate-600">{showConfirmPassword ? 'Hide' : 'Show'}</button>
-              </span>
-            </label>
-          ) : null}
-          {error ? <p className="text-sm text-rose-600">{error}</p> : null}
-          <button className="w-full rounded-xl bg-slate-900 px-4 py-3 font-semibold text-white disabled:opacity-50" disabled={busy} type="submit">
-            {busy ? (isSignUp ? 'Creating account...' : 'Signing in...') : (isSignUp ? 'Create Account' : 'Sign In')}
-          </button>
-        </form>
-
-        {!isSignUp ? (
-          <p className="text-center text-sm text-slate-500">
-            Don&apos;t have an account?{' '}
-            <button type="button" onClick={() => changeMode('signup')} className="font-semibold text-blue-700 hover:underline">
-              Create account
+          {/* Mode toggle */}
+          <div className="auth-toggle">
+            <button
+              type="button"
+              onClick={() => changeMode('signin')}
+              className={`auth-toggle-btn${!isSignUp ? ' auth-toggle-btn--active' : ''}`}
+            >
+              Sign In
             </button>
-          </p>
-        ) : null}
+            <button
+              type="button"
+              onClick={() => changeMode('signup')}
+              className={`auth-toggle-btn${isSignUp ? ' auth-toggle-btn--active' : ''}`}
+            >
+              Sign Up
+            </button>
+          </div>
+
+          {/* Form */}
+          <form onSubmit={handleSubmit} className="auth-form">
+            {isSignUp ? (
+              <div className="auth-field">
+                <label className="auth-label" htmlFor="auth-name">Full Name</label>
+                <div className="auth-input-wrap">
+                  <svg className="auth-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
+                    <circle cx="12" cy="8" r="4" />
+                    <path d="M4 20c0-4 3.6-7 8-7s8 3 8 7" strokeLinecap="round" />
+                  </svg>
+                  <input
+                    id="auth-name"
+                    className="auth-input"
+                    type="text"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    autoComplete="name"
+                    maxLength={100}
+                    placeholder="Jane Smith"
+                    required
+                  />
+                </div>
+              </div>
+            ) : null}
+
+            <div className="auth-field">
+              <label className="auth-label" htmlFor="auth-email">Email address</label>
+              <div className="auth-input-wrap">
+                <svg className="auth-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
+                  <rect x="3" y="5" width="18" height="14" rx="2" />
+                  <path d="M3 7l9 6 9-6" />
+                </svg>
+                <input
+                  id="auth-email"
+                  className="auth-input"
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  autoComplete="email"
+                  placeholder="you@example.com"
+                  required
+                />
+              </div>
+            </div>
+
+            <div className="auth-field">
+              <label className="auth-label" htmlFor="auth-password">Password</label>
+              <div className="auth-input-wrap">
+                <svg className="auth-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
+                  <rect x="5" y="11" width="14" height="10" rx="2" />
+                  <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+                </svg>
+                <input
+                  id="auth-password"
+                  className="auth-input"
+                  type={showPassword ? 'text' : 'password'}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  autoComplete={isSignUp ? 'new-password' : 'current-password'}
+                  placeholder="••••••••"
+                  required
+                />
+                <button
+                  type="button"
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  aria-pressed={showPassword}
+                  onClick={() => setShowPassword((v) => !v)}
+                  className="auth-eye-btn"
+                >
+                  {showPassword ? (
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
+                      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" />
+                      <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
+                      <line x1="1" y1="1" x2="23" y2="23" />
+                    </svg>
+                  ) : (
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
+                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                      <circle cx="12" cy="12" r="3" />
+                    </svg>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {isSignUp ? (
+              <div className="auth-field">
+                <label className="auth-label" htmlFor="auth-confirm">Confirm Password</label>
+                <div className="auth-input-wrap">
+                  <svg className="auth-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
+                    <rect x="5" y="11" width="14" height="10" rx="2" />
+                    <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+                  </svg>
+                  <input
+                    id="auth-confirm"
+                    className="auth-input"
+                    type={showConfirmPassword ? 'text' : 'password'}
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
+                    autoComplete="new-password"
+                    placeholder="••••••••"
+                    required
+                  />
+                  <button
+                    type="button"
+                    aria-label={showConfirmPassword ? 'Hide confirm password' : 'Show confirm password'}
+                    aria-pressed={showConfirmPassword}
+                    onClick={() => setShowConfirmPassword((v) => !v)}
+                    className="auth-eye-btn"
+                  >
+                    {showConfirmPassword ? (
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
+                        <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" />
+                        <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
+                        <line x1="1" y1="1" x2="23" y2="23" />
+                      </svg>
+                    ) : (
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
+                        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                        <circle cx="12" cy="12" r="3" />
+                      </svg>
+                    )}
+                  </button>
+                </div>
+              </div>
+            ) : null}
+
+            {error ? <p className="auth-error">{error}</p> : null}
+
+            <button className="auth-submit-btn" disabled={busy} type="submit">
+              {busy ? (
+                <span className="auth-submit-spinner" />
+              ) : null}
+              {busy
+                ? (isSignUp ? 'Creating account…' : 'Signing in…')
+                : (isSignUp ? 'Create Account' : 'Sign In')}
+            </button>
+          </form>
+
+          {!isSignUp ? (
+            <p className="auth-footer">
+              Don&apos;t have an account?{' '}
+              <button type="button" onClick={() => changeMode('signup')} className="auth-footer-link">
+                Create one
+              </button>
+            </p>
+          ) : (
+            <p className="auth-footer">
+              Already have an account?{' '}
+              <button type="button" onClick={() => changeMode('signin')} className="auth-footer-link">
+                Sign in
+              </button>
+            </p>
+          )}
+        </div>
+      </div>
+
+      {/* ── RIGHT: visual panel ── */}
+      <div className="auth-visual-panel" aria-hidden="true">
+        {/* Decorative blobs */}
+        <div className="auth-blob auth-blob--1" />
+        <div className="auth-blob auth-blob--2" />
+        <div className="auth-blob auth-blob--3" />
+
+        {/* Floating document cards */}
+        <div className="auth-doc-stack">
+          {/* Main doc */}
+          <div className="auth-doc auth-doc--main">
+            <div className="auth-doc-topbar">
+              <div className="auth-doc-dot" style={{background:'#f87171'}} />
+              <div className="auth-doc-dot" style={{background:'#fbbf24'}} />
+              <div className="auth-doc-dot" style={{background:'#34d399'}} />
+            </div>
+            <div className="auth-doc-lines">
+              <div className="auth-doc-line auth-doc-line--title" />
+              <div className="auth-doc-line" style={{width:'88%'}} />
+              <div className="auth-doc-line" style={{width:'75%'}} />
+              <div className="auth-doc-line" style={{width:'92%'}} />
+              <div className="auth-doc-line" style={{width:'60%'}} />
+              <div style={{height:'0.75rem'}} />
+              <div className="auth-doc-line" style={{width:'80%'}} />
+              <div className="auth-doc-line" style={{width:'95%'}} />
+              <div className="auth-doc-line" style={{width:'70%'}} />
+            </div>
+            {/* Scan line animation */}
+            <div className="auth-scan-line" />
+          </div>
+
+          {/* Result chip */}
+          <div className="auth-chip auth-chip--result">
+            <div className="auth-chip-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            </div>
+            <div>
+              <div className="auth-chip-title">Text extracted</div>
+              <div className="auth-chip-sub">98.4% accuracy</div>
+            </div>
+          </div>
+
+          {/* Stats chip */}
+          <div className="auth-chip auth-chip--stats">
+            <div className="auth-chip-icon auth-chip-icon--alt">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M3 3v18h18" />
+                <path d="M7 16l4-4 4 4 4-6" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </div>
+            <div>
+              <div className="auth-chip-title">1 240 pages</div>
+              <div className="auth-chip-sub">processed today</div>
+            </div>
+          </div>
+        </div>
+
+        {/* Caption */}
+        <div className="auth-visual-caption">
+          <p className="auth-visual-caption-title">Intelligent OCR</p>
+          <p className="auth-visual-caption-sub">Extract, search & manage document text at scale</p>
+        </div>
       </div>
     </main>
   )
@@ -206,11 +404,18 @@ function AuthConfigurationScreen() {
   )
 }
 
-function ProfilePage({ name, userEmail, createdAt, onSaveName, onBackToLibrary, onSignOut }) {
+function ProfilePage({ name, userEmail, userId, createdAt, updatedAt, lastSignInAt, emailConfirmed, documentCount, processedCount, favoriteCount, onSaveName, onBackToLibrary }) {
   const [editing, setEditing] = useState(false)
   const [draftName, setDraftName] = useState(name)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const initials = String(name || userEmail || 'User')
+    .split(/[\s@]+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0])
+    .join('')
+    .toUpperCase()
 
   useEffect(() => setDraftName(name), [name])
 
@@ -234,57 +439,69 @@ function ProfilePage({ name, userEmail, createdAt, onSaveName, onBackToLibrary, 
   }
 
   return (
-    <main className="mx-auto max-w-4xl px-4 pb-10 pt-8">
-      <div className="rounded-[30px] border border-slate-200 bg-white p-8 shadow-[0_10px_30px_rgba(15,23,42,0.05)]">
-        <div className="flex flex-wrap items-center justify-between gap-4">
+    <main className="mx-auto max-w-6xl px-4 pb-12 pt-8 sm:px-6 lg:px-8">
+      <header className="flex flex-wrap items-center justify-between gap-5 border-b border-slate-200 pb-7">
+        <div className="flex min-w-0 items-center gap-4">
+          <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-full bg-cyan-50 text-xl font-semibold text-cyan-900">{initials}</div>
+          <div className="min-w-0">
+            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Workspace account</p>
+            <h1 className="mt-1 text-2xl font-semibold text-slate-900">Your profile</h1>
+            <p className="mt-1 truncate text-sm text-slate-600">{userEmail || 'Email unavailable'}</p>
+          </div>
+        </div>
+        <button type="button" onClick={onBackToLibrary} className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:bg-slate-50">
+          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><path d="m14.5 5-7 7 7 7M8 12h13" strokeLinecap="round" strokeLinejoin="round" /></svg>
+          Back to library
+        </button>
+      </header>
+
+      <section aria-label="Workspace summary" className="grid grid-cols-3 divide-x divide-slate-200 border-b border-slate-200 py-5">
+        <div className="pr-3 sm:px-5 sm:first:pl-0"><p className="text-xs font-medium text-slate-500">Documents</p><p className="mt-1 text-2xl font-semibold text-slate-900">{documentCount}</p></div>
+        <div className="px-3 sm:px-5"><p className="text-xs font-medium text-slate-500">Processed</p><p className="mt-1 text-2xl font-semibold text-emerald-700">{processedCount}</p></div>
+        <div className="pl-3 sm:px-5"><p className="text-xs font-medium text-slate-500">Favorites</p><p className="mt-1 text-2xl font-semibold text-amber-700">{favoriteCount}</p></div>
+      </section>
+
+      <div className="grid gap-10 py-8 md:grid-cols-2 md:gap-12">
+        <section className="space-y-5 md:border-r md:border-slate-200 md:pr-10">
           <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Profile</p>
-            <h1 className="mt-2 text-3xl font-semibold text-slate-900">Your account</h1>
+            <h2 className="text-lg font-semibold text-slate-900">Personal details</h2>
+            <p className="mt-1 text-sm text-slate-500">Manage the name shown in your workspace.</p>
           </div>
-          <button type="button" onClick={onBackToLibrary} className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50">
-            Back to library
-          </button>
-        </div>
-
-        <div className="mt-8 grid gap-4 sm:grid-cols-2">
-          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-            <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Name</div>
-            <div className="mt-2 text-lg font-semibold text-slate-900">{name}</div>
-          </div>
-          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-            <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Email</div>
-            <div className="mt-2 text-lg font-semibold text-slate-900">{userEmail || 'Unknown user'}</div>
-          </div>
-          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-            <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Account created</div>
-            <div className="mt-2 text-lg font-semibold text-slate-900">{createdAt ? formatDate(createdAt) : 'Not available'}</div>
-          </div>
-        </div>
-
-        {editing ? (
-          <form onSubmit={handleSave} className="mt-6 space-y-3">
-            <label className="block space-y-1.5 text-sm font-medium text-slate-700">
-              <span>Name</span>
-              <input autoFocus maxLength={100} value={draftName} onChange={(event) => setDraftName(event.target.value)} className="w-full rounded-xl border border-slate-200 px-4 py-3 text-slate-900 outline-none focus:border-blue-400" required />
-            </label>
-            {error ? <p role="alert" className="text-sm text-rose-600">{error}</p> : null}
-            <div className="flex gap-3">
-              <button disabled={busy} className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white disabled:opacity-50">{busy ? 'Saving...' : 'Save Name'}</button>
-              <button type="button" onClick={() => { setEditing(false); setDraftName(name); setError('') }} className="rounded-full border border-slate-200 px-5 py-3 text-sm font-semibold text-slate-700">Cancel</button>
+          <div className="flex items-center justify-between gap-4 border-y border-slate-200 py-4">
+            <div className="min-w-0">
+              <p className="text-xs font-medium text-slate-500">Display name</p>
+              <p className="mt-1 truncate text-sm font-semibold text-slate-900">{name}</p>
             </div>
-          </form>
-        ) : null}
-
-        <div className="mt-8 flex flex-wrap gap-3">
-          {!editing ? (
-            <button type="button" onClick={() => setEditing(true)} className="rounded-full border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-slate-700 hover:bg-slate-50">
-              Edit Profile
-            </button>
+            {!editing ? <button type="button" onClick={() => setEditing(true)} className="shrink-0 rounded-lg border border-slate-200 px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50">Edit name</button> : null}
+          </div>
+          {editing ? (
+            <form onSubmit={handleSave} className="space-y-3">
+              <label className="block space-y-1.5 text-sm font-medium text-slate-700">
+                <span>Name</span>
+                <input autoFocus maxLength={100} value={draftName} onChange={(event) => setDraftName(event.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-slate-900 outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100" required />
+              </label>
+              {error ? <p role="alert" className="text-sm text-rose-700">{error}</p> : null}
+              <div className="flex gap-2">
+                <button disabled={busy} className="rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{busy ? 'Saving...' : 'Save changes'}</button>
+                <button type="button" onClick={() => { setEditing(false); setDraftName(name); setError('') }} className="rounded-lg border border-slate-200 px-4 py-2.5 text-sm font-semibold text-slate-700">Cancel</button>
+              </div>
+            </form>
           ) : null}
-          <button type="button" onClick={onSignOut} className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white hover:bg-slate-800">
-            Sign out
-          </button>
-        </div>
+        </section>
+
+        <section className="space-y-5">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-900">Account details</h2>
+            <p className="mt-1 text-sm text-slate-500">Security and account history.</p>
+          </div>
+          <dl className="divide-y divide-slate-200 border-y border-slate-200">
+            <div className="flex items-start justify-between gap-4 py-3"><dt className="text-sm text-slate-500">Email status</dt><dd className={`text-right text-sm font-medium ${emailConfirmed ? 'text-emerald-700' : 'text-amber-700'}`}>{emailConfirmed ? 'Verified' : 'Pending verification'}</dd></div>
+            <div className="flex items-start justify-between gap-4 py-3"><dt className="text-sm text-slate-500">Member since</dt><dd className="text-right text-sm font-medium text-slate-900">{createdAt ? formatDate(createdAt) : 'Not available'}</dd></div>
+            <div className="flex items-start justify-between gap-4 py-3"><dt className="text-sm text-slate-500">Last sign in</dt><dd className="text-right text-sm font-medium text-slate-900">{lastSignInAt ? formatDate(lastSignInAt) : 'Not available'}</dd></div>
+            <div className="flex items-start justify-between gap-4 py-3"><dt className="text-sm text-slate-500">Profile updated</dt><dd className="text-right text-sm font-medium text-slate-900">{updatedAt ? formatDate(updatedAt) : 'Not available'}</dd></div>
+            <div className="space-y-1 py-3"><dt className="text-sm text-slate-500">Account ID</dt><dd className="break-all font-mono text-xs text-slate-700">{userId || 'Not available'}</dd></div>
+          </dl>
+        </section>
       </div>
     </main>
   )
@@ -413,6 +630,7 @@ function statusTone(status) {
 
 function pageTitle(page, documentData) {
   if (page === 'profile') return 'Profile'
+  if (page === 'library') return 'Library'
   if (page === 'processing') return 'Processing Document'
   if (page === 'viewer') {
     return documentData ? `Reviewing ${documentData.name}` : 'Document Viewer'
@@ -607,12 +825,18 @@ function EffectRegister({ popupRef, onClose }) {
   return null
 }
 
-function TopBar({ pageLabel, documentData, onNavigateLanding, searchQuery, setSearchQuery, searchMode, setSearchMode, onRefresh, serverResults, serverPopupOpen, onCloseSearchResults, onSelectSearchResult, userEmail, onOpenProfile, onSignOut }) {
+function TopBar({ pageLabel, documentData, onNavigateLanding, searchQuery, setSearchQuery, searchMode, setSearchMode, onRefresh, serverResults, serverPopupOpen, onCloseSearchResults, onSelectSearchResult, userEmail, onOpenProfile, onOpenLibrary, onSignOut }) {
   const searchPopupRef = useRef(null)
+  const searchModeRef = useRef(null)
+  const accountMenuRef = useRef(null)
+  const [searchModeOpen, setSearchModeOpen] = useState(false)
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false)
 
   return (
     <header className="sticky top-0 z-30 border-b border-slate-200/80 bg-white/95 backdrop-blur-xl">
       <EffectRegister popupRef={searchPopupRef} onClose={onCloseSearchResults} />
+      <EffectRegister popupRef={searchModeRef} onClose={() => setSearchModeOpen(false)} />
+      <EffectRegister popupRef={accountMenuRef} onClose={() => setAccountMenuOpen(false)} />
       <div className="mx-auto flex max-w-[1600px] flex-col gap-3 px-4 py-3 sm:px-6 lg:flex-row lg:items-center lg:justify-between lg:px-8 lg:py-4">
         <button type="button" onClick={onNavigateLanding} className="flex min-w-0 items-center gap-3 text-left">
           <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-slate-200 bg-gradient-to-br from-blue-600 to-cyan-500 text-white shadow-sm">
@@ -628,12 +852,52 @@ function TopBar({ pageLabel, documentData, onNavigateLanding, searchQuery, setSe
         </button>
 
         <div className="flex shrink-0 items-center justify-end gap-2 sm:gap-3">
-          {pageLabel === 'Document Dashboard' ? (
+          {pageLabel === 'Document Dashboard' || pageLabel === 'Library' ? (
             <div ref={searchPopupRef} className="relative flex max-w-full items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2">
-              <select value={searchMode} onChange={(event) => setSearchMode?.(event.target.value)} className="rounded-md border bg-white px-2 py-1 text-sm">
-                <option value="documents">Docs</option>
-                <option value="attributes">Attrs</option>
-              </select>
+              <div ref={searchModeRef} className="relative shrink-0">
+                <button
+                  type="button"
+                  aria-label="Choose search type"
+                  aria-haspopup="menu"
+                  aria-expanded={searchModeOpen}
+                  onClick={() => setSearchModeOpen((open) => !open)}
+                  className="flex h-9 w-24 items-center justify-between gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-cyan-200"
+                >
+                  {searchMode === 'documents' ? 'Docs' : 'Attrs'}
+                  <svg viewBox="0 0 20 20" className={`h-4 w-4 text-slate-500 transition-transform ${searchModeOpen ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><path d="m5 7.5 5 5 5-5" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                </button>
+                {searchModeOpen ? (
+                  <div role="menu" className="absolute left-0 top-full z-50 mt-2 w-64 overflow-hidden rounded-xl border border-slate-200 bg-white p-1.5 shadow-xl">
+                    {[
+                      { value: 'documents', label: 'Documents', description: 'Search file names and extracted fields' },
+                      { value: 'attributes', label: 'Attributes', description: 'Search extracted values and labels' },
+                    ].map((mode) => (
+                      <button
+                        key={mode.value}
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={searchMode === mode.value}
+                        onClick={() => {
+                          setSearchMode?.(mode.value)
+                          setSearchModeOpen(false)
+                        }}
+                        className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition ${searchMode === mode.value ? 'bg-cyan-50 text-cyan-950' : 'text-slate-700 hover:bg-slate-50'}`}
+                      >
+                        <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${searchMode === mode.value ? 'bg-white text-cyan-700' : 'bg-slate-100 text-slate-500'}`}>
+                          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
+                            {mode.value === 'documents' ? <><path d="M6 3.5h8l4 4v13H6z" /><path d="M14 3.5v4h4M9 13h6M9 16h6" strokeLinecap="round" /></> : <><path d="M4 7h16M4 12h10M4 17h7" strokeLinecap="round" /><circle cx="18" cy="16" r="3" /></>}
+                          </svg>
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block text-sm font-semibold">{mode.label}</span>
+                          <span className="mt-0.5 block text-xs text-slate-500">{mode.description}</span>
+                        </span>
+                        {searchMode === mode.value ? <svg viewBox="0 0 20 20" className="h-4 w-4 shrink-0 text-cyan-700" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="m4 10 4 4 8-8" strokeLinecap="round" strokeLinejoin="round" /></svg> : null}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
               <input type="search" value={searchQuery} onChange={(event) => setSearchQuery?.(event.target.value)} placeholder={searchMode === 'documents' ? 'Search documents' : 'Search attributes'} className="w-32 bg-transparent text-sm text-slate-900 outline-none placeholder:text-slate-400 sm:w-48 lg:w-72" />
               {serverPopupOpen && serverResults?.length ? (
                 <div className="absolute right-0 top-full z-50 mt-2 w-[min(720px,calc(100vw-2rem))] overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl">
@@ -662,10 +926,42 @@ function TopBar({ pageLabel, documentData, onNavigateLanding, searchQuery, setSe
             </>
           ) : null}
 
-          <button type="button" onClick={onOpenProfile} className="rounded-full border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
-            {userEmail ? userEmail.split('@')[0] : 'Profile'}
-          </button>
-          <button type="button" onClick={onSignOut} className="rounded-full bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-800">Sign out</button>
+          <div ref={accountMenuRef} className="relative">
+            <button
+              type="button"
+              aria-label="Open account menu"
+              aria-haspopup="menu"
+              aria-expanded={accountMenuOpen}
+              onClick={() => setAccountMenuOpen((open) => !open)}
+              className="flex items-center gap-2 rounded-full border border-slate-200 bg-white py-1.5 pl-1.5 pr-2.5 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:bg-slate-50"
+            >
+              <span className="flex h-8 w-8 items-center justify-center rounded-full bg-cyan-50 text-xs font-semibold text-cyan-800">
+                {(userEmail?.[0] || 'P').toUpperCase()}
+              </span>
+              <span className="hidden max-w-36 truncate sm:inline">{userEmail ? userEmail.split('@')[0] : 'Account'}</span>
+              <svg viewBox="0 0 20 20" className={`h-4 w-4 transition-transform ${accountMenuOpen ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
+                <path d="m5 7.5 5 5 5-5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            {accountMenuOpen ? (
+              <div role="menu" className="absolute right-0 top-full z-50 mt-2 w-56 overflow-hidden rounded-xl border border-slate-200 bg-white py-1 shadow-xl">
+                {userEmail ? <p className="truncate border-b border-slate-100 px-4 py-3 text-xs text-slate-500">{userEmail}</p> : null}
+                <button type="button" role="menuitem" onClick={() => { setAccountMenuOpen(false); onOpenProfile?.() }} className="flex w-full items-center gap-3 px-4 py-2.5 text-left text-sm text-slate-700 hover:bg-slate-50">
+                  <svg viewBox="0 0 24 24" className="h-4 w-4 text-slate-500" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><circle cx="12" cy="8" r="3.5" /><path d="M4.5 20a7.5 7.5 0 0 1 15 0" strokeLinecap="round" /></svg>
+                  Profile
+                </button>
+                <button type="button" role="menuitem" onClick={() => { setAccountMenuOpen(false); onOpenLibrary?.() }} className="flex w-full items-center gap-3 px-4 py-2.5 text-left text-sm text-slate-700 hover:bg-slate-50">
+                  <svg viewBox="0 0 24 24" className="h-4 w-4 text-slate-500" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><path d="M3.5 6.5h6l2 2H20a1.5 1.5 0 0 1 1.5 1.5v8a1.5 1.5 0 0 1-1.5 1.5h-17A1.5 1.5 0 0 1 1.5 18v-10a1.5 1.5 0 0 1 2-1.5Z" /></svg>
+                  Library
+                </button>
+                <div className="my-1 border-t border-slate-100" />
+                <button type="button" role="menuitem" onClick={() => { setAccountMenuOpen(false); onSignOut?.() }} className="flex w-full items-center gap-3 px-4 py-2.5 text-left text-sm text-rose-700 hover:bg-rose-50">
+                  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><path d="M10 17l5-5-5-5M15 12H3" strokeLinecap="round" strokeLinejoin="round" /><path d="M12 3h6a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-6" strokeLinecap="round" /></svg>
+                  Sign out
+                </button>
+              </div>
+            ) : null}
+          </div>
         </div>
       </div>
     </header>
@@ -692,6 +988,10 @@ function LandingPage({
   serverLoading,
   serverError,
   serverTotal,
+  libraryOnly = false,
+  allDocuments = documents,
+  onOpenLibrary,
+  onBackToDashboard,
 }) {
   const [dragActive, setDragActive] = useState(false)
   const fileInputRef = useRef(null)
@@ -799,10 +1099,12 @@ function LandingPage({
   // Recent history should not be filtered by the global search input —
   // search results are shown in the popup. Keep recent documents stable.
   const recentDocuments = historyFilter === 'recent' ? filteredHistory.slice(0, 10) : filteredHistory
+  const processedCount = allDocuments.filter((document) => String(document.status || '').toUpperCase() === 'PROCESSED').length
+  const favoriteCount = allDocuments.filter((document) => favoriteIds.includes(document.id)).length
 
   return (
-    <div className="mx-auto grid min-h-[calc(100vh-140px)] max-w-[1800px] gap-6 px-4 pb-8 pt-6 lg:px-8">
-      <section className="grid gap-8 rounded-[28px] border border-slate-200 bg-white px-4 py-8 shadow-[0_10px_30px_rgba(15,23,42,0.05)] lg:grid-cols-1 lg:px-12">
+    <div className={libraryOnly ? 'mx-auto min-h-[calc(100vh-72px)] max-w-7xl px-4 pb-10 pt-8 sm:px-6 lg:px-8' : 'mx-auto grid min-h-[calc(100vh-140px)] max-w-[1800px] gap-6 px-4 pb-8 pt-6 lg:px-8'}>
+      <section className={`${libraryOnly ? 'hidden' : ''} grid gap-8 rounded-[28px] border border-slate-200 bg-white px-4 py-8 shadow-[0_10px_30px_rgba(15,23,42,0.05)] lg:grid-cols-1 lg:px-12`}>
         <div className="w-full">
           <div className="grid gap-8">
             <div className="space-y-5">
@@ -918,15 +1220,34 @@ function LandingPage({
         </div>
       </section>
 
-      <section className="rounded-[28px] border border-slate-200 bg-white p-5 shadow-[0_10px_30px_rgba(15,23,42,0.05)] overflow-hidden">
+      <section className={`${libraryOnly ? 'border-0 p-0 shadow-none' : 'rounded-[28px] border border-slate-200 bg-white p-5 shadow-[0_10px_30px_rgba(15,23,42,0.05)]'} overflow-hidden`}>
         <div className="space-y-5">
-          <div>
+          <div className="flex flex-wrap items-end justify-between gap-4">
+            <div>
             <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">Library</p>
-            <h1 className="mt-2 text-2xl font-semibold text-slate-900">Processed documents</h1>
-            <p className="mt-2 text-sm leading-6 text-slate-500">Search by filename, extracted fields, or document metadata.</p>
+            <h1 className="mt-2 text-2xl font-semibold text-slate-900">{libraryOnly ? 'Your document library' : 'Processed documents'}</h1>
+            <p className="mt-2 text-sm leading-6 text-slate-500">{libraryOnly ? 'Browse, revisit, and organize every document in your workspace.' : 'Search by filename, extracted fields, or document metadata.'}</p>
+            </div>
+            {libraryOnly ? (
+              <button type="button" onClick={onBackToDashboard} className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:bg-slate-50">
+                <svg viewBox="0 0 20 20" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><path d="M15.5 10h-12m5 5-5-5 5-5" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                Back to dashboard
+              </button>
+            ) : (
+              <button type="button" onClick={onOpenLibrary} className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:bg-slate-50">
+                Open library
+                <svg viewBox="0 0 20 20" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true"><path d="M3.5 10h12m-5-5 5 5-5 5" strokeLinecap="round" strokeLinejoin="round" /></svg>
+              </button>
+            )}
           </div>
 
-          
+          {libraryOnly ? (
+            <div className="grid grid-cols-3 divide-x divide-slate-200 border-y border-slate-200 py-4">
+              <div className="px-3 first:pl-0 sm:px-5"><p className="text-xs font-medium text-slate-500">All documents</p><p className="mt-1 text-xl font-semibold text-slate-900">{allDocuments.length}</p></div>
+              <div className="px-3 sm:px-5"><p className="text-xs font-medium text-slate-500">Processed</p><p className="mt-1 text-xl font-semibold text-emerald-700">{processedCount}</p></div>
+              <div className="px-3 sm:px-5"><p className="text-xs font-medium text-slate-500">Favorites</p><p className="mt-1 text-xl font-semibold text-amber-700">{favoriteCount}</p></div>
+            </div>
+          ) : null}
 
           {showFilters ? (
             <div className="mt-3 grid gap-2 sm:grid-cols-2">
@@ -990,7 +1311,7 @@ function LandingPage({
               <span className="rounded-full bg-white px-2.5 py-1 text-xs text-slate-500 shadow-sm">{recentDocuments.length}</span>
             </div>
 
-            <div className="max-h-[calc(100vh-260px)] space-y-2 overflow-auto pr-2">
+            <div className={`${libraryOnly ? 'max-h-none' : 'max-h-[calc(100vh-260px)]'} space-y-2 overflow-auto pr-2`}>
               {documentsLoading ? (
                 <div className="space-y-2">
                   {Array.from({ length: 5 }).map((_, index) => (
@@ -1052,7 +1373,7 @@ function LandingPage({
                 ))
               ) : (
                 <div className="rounded-2xl border border-dashed border-slate-200 bg-white px-4 py-10 text-center text-sm text-slate-500">
-                  {searchQuery ? 'No results match your search.' : 'No recent documents yet.'}
+                  {searchQuery ? 'No results match your search.' : historyFilter === 'favorites' ? 'No favorites yet. Star a document to keep it here.' : historyFilter === 'all' ? 'No processed documents yet.' : 'No recent documents yet.'}
                 </div>
               )}
 
@@ -1201,8 +1522,8 @@ function ProcessingPage({ activity, progress, etaLabel, documentData, processing
               ) : null}
             </div>
 
-            <div className="mx-auto max-w-2xl space-y-4 lg:mx-0">
-              <div className="rounded-full bg-slate-100 p-1">
+            <div className="w-full space-y-4">
+              <div role="progressbar" aria-label="Document processing progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress)} className="w-full rounded-full bg-slate-100 p-1">
                 <div className="h-3 rounded-full bg-gradient-to-r from-blue-600 to-cyan-500 transition-all duration-500" style={{ width: `${Math.min(100, Math.max(0, progress))}%` }} />
               </div>
               <div className="flex flex-wrap items-center justify-between gap-3 text-sm text-slate-500">
@@ -3045,6 +3366,10 @@ export default function App() {
           onSelectSearchResult={handleSelectSearchResult}
           userEmail={currentUserEmail}
           onOpenProfile={() => setProfileOpen(true)}
+          onOpenLibrary={() => {
+            setProfileOpen(false)
+            setPage('library')
+          }}
           onSignOut={async () => {
             if (!supabase) return
             await supabase.auth.signOut()
@@ -3056,18 +3381,18 @@ export default function App() {
         <ProfilePage
           name={profile?.name || profileName || 'Name not set'}
           userEmail={currentUserEmail}
+          userId={session?.user?.id}
           createdAt={createdAt}
+          updatedAt={profile?.updated_at}
+          lastSignInAt={session?.user?.last_sign_in_at}
+          emailConfirmed={Boolean(session?.user?.email_confirmed_at || session?.user?.confirmed_at)}
+          documentCount={documents.length}
+          processedCount={documents.filter((document) => String(document.status || '').toUpperCase() === 'PROCESSED').length}
+          favoriteCount={documents.filter((document) => favoriteIds.includes(document.id)).length}
           onSaveName={saveProfileName}
           onBackToLibrary={() => {
             setProfileOpen(false)
-            setPage('landing')
-          }}
-          onSignOut={async () => {
-            if (!supabase) return
-            await supabase.auth.signOut()
-            setSession(null)
-            setProfileOpen(false)
-            setPage('landing')
+            setPage('library')
           }}
         />
       </div>
@@ -3094,6 +3419,10 @@ export default function App() {
         onSelectSearchResult={handleSelectSearchResult}
         userEmail={currentUserEmail}
         onOpenProfile={() => setProfileOpen(true)}
+        onOpenLibrary={() => {
+          setProfileOpen(false)
+          setPage('library')
+        }}
         onSignOut={async () => {
           if (!supabase) return
           await supabase.auth.signOut()
@@ -3111,9 +3440,13 @@ export default function App() {
       ) : null}
 
       <main className="page-fade-in">
-        {page === 'landing' ? (
+        {page === 'landing' || page === 'library' ? (
           <LandingPage
             documents={visibleDocuments}
+            allDocuments={documents}
+            libraryOnly={page === 'library'}
+            onOpenLibrary={() => setPage('library')}
+            onBackToDashboard={() => setPage('landing')}
             documentsLoading={documentsLoading}
             searchQuery={searchQuery}
             setSearchQuery={handleSetSearchQuery}
