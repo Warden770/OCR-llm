@@ -638,18 +638,68 @@ function pageTitle(page, documentData) {
   return 'Document Dashboard'
 }
 
+function readTableStructure(attribute) {
+  if (attribute?.table_structure && typeof attribute.table_structure === 'object') {
+    return attribute.table_structure
+  }
+  try {
+    const parsed = JSON.parse(attribute?.extracted_value || '')
+    if (parsed?.kind !== 'table') return null
+    return parsed.table && typeof parsed.table === 'object' ? parsed.table : parsed
+  } catch {
+    return null
+  }
+}
+
 function normalizeDocumentAttributes(attributes) {
-  return attributes.map((attribute) => ({
-    ...attribute,
-    source: attribute.source || 'model',
-    saved: attribute.saved ?? Boolean(attribute.id),
-    draft_label: attribute.entity_type_label,
-    draft_value: attribute.extracted_value,
-    draft_validation_status: attribute.validation_status,
-    original_label: attribute.entity_type_label,
-    original_value: attribute.extracted_value,
-    original_validation_status: attribute.validation_status,
-  }))
+  return attributes.map((attribute) => {
+    const tableData = readTableStructure(attribute)
+    return {
+      ...attribute,
+      kind: tableData ? 'table' : attribute.kind,
+      table_data: tableData,
+      source: attribute.source || 'model',
+      saved: attribute.saved ?? Boolean(attribute.id),
+      draft_label: attribute.entity_type_label,
+      draft_value: attribute.extracted_value,
+      draft_validation_status: attribute.validation_status,
+      original_label: attribute.entity_type_label,
+      original_value: attribute.extracted_value,
+      original_validation_status: attribute.validation_status,
+    }
+  })
+}
+
+function isStructuredTable(table) {
+  const rows = Array.isArray(table?.rows) ? table.rows : []
+  const columns = Array.isArray(table?.columns) ? table.columns : []
+  if (rows.length < 2 || columns.length < 2) {
+    return false
+  }
+  const multiCellRows = rows.filter((row) => (row.cells || []).filter((cell) => String(cell.text || '').trim()).length >= 2).length
+  return multiCellRows >= Math.max(2, Math.ceil(rows.length * 0.5))
+}
+
+function collectDocumentTables(ocrPages, attributes) {
+  const tablesById = new Map()
+  for (const page of ocrPages || []) {
+    for (const table of page.tables || []) {
+      if (isStructuredTable(table)) {
+        tablesById.set(table.id, table)
+      }
+    }
+  }
+  for (const attribute of attributes || []) {
+    const table = attribute.table_data || (attribute.kind === 'table' ? readTableStructure(attribute) : null)
+    if (table && table.id && isStructuredTable(table)) {
+      tablesById.set(table.id, table)
+    }
+  }
+  return [...tablesById.values()].sort((left, right) =>
+    Number(left.page_number) - Number(right.page_number)
+    || Number(left.bbox?.[1] || 0) - Number(right.bbox?.[1] || 0)
+    || Number(left.bbox?.[0] || 0) - Number(right.bbox?.[0] || 0),
+  )
 }
 
 function boxesOverlap(a, b) {
@@ -1593,6 +1643,150 @@ function CanceledDocumentPage({ documentData, onBackToLibrary, onProcessAgain, p
   )
 }
 
+function ReconstructedTableCard({
+  table,
+  selected,
+  selectedCellKeys,
+  onToggleTable,
+  onToggleCell,
+  onEditCell,
+  onToggleHeader,
+  onEditTitle,
+  onEditCaption,
+  onCompare,
+  onAddRow,
+  onRemoveRow,
+  onAddColumn,
+  onRemoveColumn,
+  onMergeCells,
+  onSplitCell,
+}) {
+  const rows = table.rows || []
+  const tableConfidenceTone = confidenceBorderTone(Number(table.confidence_score || 0))
+  const columnWidths = table.columns || []
+  const columnTotal = columnWidths.reduce((sum, width) => sum + Number(width || 0), 0) || columnWidths.length || 1
+  const tableHeight = Math.max(1, Number(table.bbox?.[3] || 0) - Number(table.bbox?.[1] || 0))
+  const displayHeight = Math.max(190, rows.length * 42)
+  const selectedCells = rows.flatMap((row) => row.cells || []).filter((cell) => selectedCellKeys.has(`${table.id}:${cell.id}`))
+  const canMerge = selectedCells.length > 1
+    && selectedCells.every((cell) => Number(cell.rowspan || 1) === 1)
+    && new Set(selectedCells.map((cell) => cell.row_index)).size === 1
+    && selectedCells.map((cell) => cell.column_index).sort((left, right) => left - right).every((column, index, columns) => index === 0 || column === columns[index - 1] + 1)
+
+  return (
+    <section className={`overflow-hidden rounded-[20px] border-2 ${tableConfidenceTone}`}>
+      <header className="space-y-3 border-b border-slate-200 px-4 py-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-[150px] flex-1">
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+              {table.style?.layout_source === 'detected_rules' ? 'Page-rule reconstruction' : 'OCR-aligned reconstruction'}
+              {' · Page '}{table.page_number}
+            </p>
+            <input
+              aria-label="Table title"
+              value={table.title || 'Table'}
+              onChange={(event) => onEditTitle(table.id, event.target.value)}
+              className="mt-1 w-full bg-transparent text-base font-semibold text-slate-900 outline-none focus:border-b focus:border-slate-400"
+            />
+          </div>
+          <label className="flex items-center gap-2 pt-1 text-xs font-medium text-slate-600">
+            <input type="checkbox" checked={selected} onChange={() => onToggleTable(table.id)} />
+            Select table
+          </label>
+        </div>
+        <input
+          aria-label="Table caption"
+          value={table.caption || ''}
+          onChange={(event) => onEditCaption(table.id, event.target.value)}
+          placeholder="Caption or section heading"
+          className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 outline-none focus:border-slate-400"
+        />
+        <div className="flex flex-wrap gap-1.5">
+          <button type="button" onClick={() => onCompare(table)} className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100">Compare on page</button>
+          <button type="button" onClick={() => onAddRow(table.id)} className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100">Add row</button>
+          <button type="button" onClick={() => onRemoveRow(table.id)} disabled={rows.length <= 1} className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 disabled:opacity-40">Remove last row</button>
+          <button type="button" onClick={() => onAddColumn(table.id)} className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100">Add column</button>
+          <button type="button" onClick={() => onRemoveColumn(table.id)} disabled={columnWidths.length <= 1} className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 disabled:opacity-40">Remove last column</button>
+          <button type="button" onClick={() => onMergeCells(table.id)} disabled={!canMerge} className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 disabled:opacity-40">Merge selected</button>
+          <button type="button" onClick={() => onSplitCell(table.id, selectedCells[0]?.id)} disabled={selectedCells.length !== 1 || (Number(selectedCells[0]?.colspan || 1) <= 1 && Number(selectedCells[0]?.rowspan || 1) <= 1)} className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 disabled:opacity-40">Split selected</button>
+        </div>
+      </header>
+
+      <div className="overflow-x-auto overflow-y-hidden bg-white p-3">
+        <table className="min-w-full border-collapse text-left text-xs text-slate-800" style={{ tableLayout: 'fixed' }}>
+          <colgroup>
+            {columnWidths.map((width, index) => <col key={`${table.id}-column-${index}`} style={{ width: `${Number(width || 0) / columnTotal * 100}%` }} />)}
+          </colgroup>
+          <tbody>
+            {rows.map((row, rowIndex) => {
+              const rowHeight = Math.max(32, Number(row.height || 0) / tableHeight * displayHeight)
+              return (
+                <tr key={row.id || `${table.id}-row-${rowIndex}`} style={{ height: `${rowHeight}px` }}>
+                  {(row.cells || []).map((cell) => {
+                    const cellKey = `${table.id}:${cell.id}`
+                    const CellTag = cell.is_header ? 'th' : 'td'
+                    const isSelected = selectedCellKeys.has(cellKey)
+                    const borderColor = table.style?.bordered ? '#94a3b8' : '#cbd5e1'
+                    return (
+                      <CellTag
+                        key={cell.id}
+                        rowSpan={Math.max(1, Number(cell.rowspan || 1))}
+                        colSpan={Math.max(1, Number(cell.colspan || 1))}
+                        className={`align-top p-1.5 ${isSelected ? 'bg-cyan-100 ring-2 ring-inset ring-cyan-600' : cell.is_header ? 'bg-slate-100' : 'bg-white'}`}
+                        style={{
+                          border: table.style?.bordered ? `${Math.max(1, Number(table.style.border_width || 1))}px solid ${borderColor}` : '0',
+                          borderBottom: table.style?.bordered ? undefined : `1px dashed ${borderColor}`,
+                          textAlign: cell.alignment || 'left',
+                          fontSize: `${11 * Number(cell.font_scale || 1)}px`,
+                        }}
+                        onClick={() => onToggleCell(table.id, cell.id)}
+                      >
+                        <div className="flex h-full min-w-0 items-start gap-1.5">
+                          <input
+                            aria-label={`Select cell ${rowIndex + 1}, ${Number(cell.column_index || 0) + 1}`}
+                            type="checkbox"
+                            checked={isSelected}
+                            onClick={(event) => event.stopPropagation()}
+                            onChange={() => onToggleCell(table.id, cell.id)}
+                            className="mt-1 shrink-0"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <textarea
+                              aria-label={`Cell ${rowIndex + 1}, ${Number(cell.column_index || 0) + 1}`}
+                              value={cell.text || ''}
+                              rows={Math.min(5, Math.max(1, String(cell.text || '').split('\n').length))}
+                              onClick={(event) => event.stopPropagation()}
+                              onChange={(event) => onEditCell(table.id, cell.id, event.target.value)}
+                              className={`w-full min-w-[52px] resize-y overflow-hidden rounded-sm bg-transparent p-0.5 text-xs leading-4 outline-none focus:bg-white focus:ring-1 focus:ring-cyan-600 ${cell.bold || cell.is_header ? 'font-semibold' : 'font-normal'}`}
+                            />
+                            <button
+                              type="button"
+                              onClick={(event) => { event.stopPropagation(); onToggleHeader(table.id, cell.id) }}
+                              className="mt-1 rounded px-1 py-0.5 text-[10px] font-semibold uppercase text-slate-500 hover:bg-slate-100"
+                              title="Toggle header emphasis"
+                            >
+                              {cell.is_header ? 'Header' : 'Body'}
+                            </button>
+                          </div>
+                        </div>
+                      </CellTag>
+                    )
+                  })}
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 px-4 py-2 text-[11px] text-slate-500">
+        <span>{rows.length} rows · {columnWidths.length} columns · {Math.round(Number(table.confidence_score || 0) * 100)}% layout confidence</span>
+        {table.uncertain_fields?.length ? <span title={table.uncertain_fields.join(', ')}>Needs visual check: {table.uncertain_fields.slice(0, 2).join(', ')}</span> : <span>Cell geometry detected from page rules</span>}
+      </footer>
+    </section>
+  )
+}
+
 function ViewerPage({
   apiBaseUrl,
   documentData,
@@ -1622,6 +1816,46 @@ function ViewerPage({
   const [manualPageNumber, setManualPageNumber] = useState(1)
   const [reviewError, setReviewError] = useState('')
   const [savingSelected, setSavingSelected] = useState(false)
+  const [activePanelTab, setActivePanelTab] = useState('tables')
+  const [selectedTableKeys, setSelectedTableKeys] = useState(() => new Set())
+  const [selectedCellKeys, setSelectedCellKeys] = useState(() => new Set())
+  const [selectedTextFieldKeys, setSelectedTextFieldKeys] = useState(() => new Set())
+  const [bulletFieldDraft, setBulletFieldDraft] = useState('')
+  const initialTables = useMemo(() => collectDocumentTables(ocrPages, attributes), [attributes, ocrPages])
+  const [detectedTables, setDetectedTables] = useState(initialTables)
+
+  useEffect(() => {
+    setDetectedTables(initialTables)
+    setSelectedTableKeys(new Set())
+    setSelectedCellKeys(new Set())
+  }, [initialTables])
+
+  const textFieldEntries = useMemo(() => (reviewAttributes || []).filter((attribute) => attribute.kind !== 'table'), [reviewAttributes])
+
+  const selectedTableTokenKeys = useMemo(() => {
+    const tokenKeys = new Set()
+    for (const table of detectedTables) {
+      const selectedCells = (table.rows || []).flatMap((row) => row.cells || []).filter((cell) => selectedCellKeys.has(`${table.id}:${cell.id}`))
+      if (!selectedTableKeys.has(table.id) && !selectedCells.length) {
+        continue
+      }
+      for (const page of ocrPages || []) {
+        if (Number(page.page_number) !== Number(table.page_number)) {
+          continue
+        }
+        const selectedBoxes = selectedTableKeys.has(table.id) ? [table.bbox] : selectedCells.map((cell) => cell.bbox)
+        for (const line of page.lines || []) {
+          for (const token of line.tokens || []) {
+            const tokenKey = `${page.page_number}:${token.token_index}`
+            if (selectedBoxes.some((box) => boxesOverlap(box, token.bbox))) {
+              tokenKeys.add(tokenKey)
+            }
+          }
+        }
+      }
+    }
+    return tokenKeys
+  }, [detectedTables, ocrPages, selectedCellKeys, selectedTableKeys])
 
   const { tokenToAttribute, attributeToTokens } = useMemo(
     () => buildTokenAttributeIndex(reviewAttributes, ocrPages),
@@ -1683,6 +1917,231 @@ function ViewerPage({
     )
   }
 
+  const updateTable = (tableId, transform) => {
+    setDetectedTables((current) => current.map((table) => (table.id === tableId ? transform(table) : table)))
+  }
+
+  const toggleTableSelection = (tableId) => {
+    setSelectedTableKeys((current) => {
+      const next = new Set(current)
+      if (next.has(tableId)) next.delete(tableId)
+      else next.add(tableId)
+      return next
+    })
+  }
+
+  const toggleCellSelection = (tableId, cellId) => {
+    const key = `${tableId}:${cellId}`
+    setSelectedCellKeys((current) => {
+      const next = new Set(current)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  const editTableCell = (tableId, cellId, text) => {
+    updateTable(tableId, (table) => ({
+      ...table,
+      rows: table.rows.map((row) => ({
+        ...row,
+        cells: row.cells.map((cell) => cell.id === cellId ? { ...cell, text, corrected: text !== cell.original_text } : cell),
+      })),
+    }))
+  }
+
+  const toggleTableHeader = (tableId, cellId) => {
+    updateTable(tableId, (table) => ({
+      ...table,
+      rows: table.rows.map((row) => ({
+        ...row,
+        cells: row.cells.map((cell) => cell.id === cellId ? { ...cell, is_header: !cell.is_header, bold: !cell.is_header } : cell),
+      })),
+    }))
+  }
+
+  const addTableRow = (tableId) => {
+    updateTable(tableId, (table) => {
+      const rowIndex = table.rows.length
+      const columnCount = Math.max(1, table.columns.length)
+      const previousHeight = Number(table.rows.at(-1)?.height || 35)
+      const y0 = Number(table.bbox?.[3] || 0)
+      const x0 = Number(table.bbox?.[0] || 0)
+      const tableWidth = Math.max(1, Number(table.bbox?.[2] || 1000) - x0)
+      const columnTotal = table.columns.reduce((sum, width) => sum + Number(width || 0), 0) || columnCount
+      let currentX = x0
+      const cells = Array.from({ length: columnCount }, (_, columnIndex) => ({
+        ...(() => {
+          const share = Number(table.columns[columnIndex] || 1) / columnTotal
+          const cellX0 = currentX
+          currentX = columnIndex === columnCount - 1 ? x0 + tableWidth : currentX + tableWidth * share
+          return {
+            id: `edit-r${rowIndex}-c${columnIndex}-${Date.now()}`,
+            row_index: rowIndex,
+            column_index: columnIndex,
+            text: '',
+            original_text: '',
+            bbox: [cellX0, y0, currentX, Math.min(1000, y0 + previousHeight)],
+            rowspan: 1,
+            colspan: 1,
+            is_header: false,
+            bold: false,
+            alignment: 'left',
+            confidence_score: 0,
+            token_indices: [],
+            uncertain: true,
+          }
+        })(),
+      }))
+      return { ...table, rows: [...table.rows, { id: `edit-row-${Date.now()}`, index: rowIndex, height: previousHeight, cells }], uncertain_fields: [...new Set([...(table.uncertain_fields || []), 'edited_row_geometry'])] }
+    })
+  }
+
+  const removeTableRow = (tableId) => {
+    updateTable(tableId, (table) => ({ ...table, rows: table.rows.slice(0, -1).map((row, index) => ({ ...row, index })) }))
+  }
+
+  const addTableColumn = (tableId) => {
+    updateTable(tableId, (table) => {
+      const columnIndex = table.columns.length
+      const columnWidth = table.columns.length ? table.columns[table.columns.length - 1] : 100
+      return {
+        ...table,
+        columns: [...table.columns, columnWidth],
+        rows: table.rows.map((row, rowIndex) => ({
+          ...row,
+          cells: [...row.cells, {
+            id: `edit-r${rowIndex}-c${columnIndex}-${Date.now()}`,
+            row_index: rowIndex,
+            column_index: columnIndex,
+            text: '',
+            original_text: '',
+            bbox: [Number(table.bbox?.[2] || 0), Number(table.bbox?.[1] || 0), Math.min(1000, Number(table.bbox?.[2] || 0) + columnWidth), Number(table.bbox?.[3] || 0)],
+            rowspan: 1,
+            colspan: 1,
+            is_header: rowIndex === 0,
+            bold: rowIndex === 0,
+            alignment: 'left',
+            confidence_score: 0,
+            token_indices: [],
+            uncertain: true,
+          }],
+        })),
+        uncertain_fields: [...new Set([...(table.uncertain_fields || []), 'edited_column_geometry'])],
+      }
+    })
+  }
+
+  const removeTableColumn = (tableId) => {
+    updateTable(tableId, (table) => ({
+      ...table,
+      columns: table.columns.slice(0, -1),
+      rows: table.rows.map((row) => ({ ...row, cells: row.cells.filter((cell) => Number(cell.column_index || 0) < table.columns.length - 1) })),
+    }))
+  }
+
+  const mergeSelectedTableCells = (tableId) => {
+    const table = detectedTables.find((item) => item.id === tableId)
+    if (!table) return
+    const selected = table.rows.flatMap((row) => row.cells || []).filter((cell) => selectedCellKeys.has(`${tableId}:${cell.id}`))
+    if (selected.length < 2) return
+    const rowIndex = selected[0].row_index
+    const ordered = selected.sort((left, right) => left.column_index - right.column_index)
+    const row = table.rows.find((item) => item.index === rowIndex || item.cells.some((cell) => cell.id === ordered[0].id))
+    if (!row || ordered.some((cell, index) => Number(cell.rowspan || 1) !== 1 || (index > 0 && cell.column_index !== ordered[index - 1].column_index + 1))) return
+    const mergedCell = {
+      ...ordered[0],
+      id: `merged-${Date.now()}`,
+      text: ordered.map((cell) => cell.text || '').join('\n'),
+      original_text: ordered.map((cell) => cell.original_text || '').join('\n'),
+      colspan: ordered.reduce((sum, cell) => sum + Number(cell.colspan || 1), 0),
+      bbox: [
+        Math.min(...ordered.map((cell) => cell.bbox[0])),
+        Math.min(...ordered.map((cell) => cell.bbox[1])),
+        Math.max(...ordered.map((cell) => cell.bbox[2])),
+        Math.max(...ordered.map((cell) => cell.bbox[3])),
+      ],
+      merged_parts: ordered,
+      uncertain: true,
+    }
+    updateTable(tableId, (currentTable) => ({
+      ...currentTable,
+      rows: currentTable.rows.map((currentRow) => currentRow === row ? {
+        ...currentRow,
+        cells: [...currentRow.cells.filter((cell) => !ordered.some((selectedCell) => selectedCell.id === cell.id)), mergedCell].sort((left, right) => left.column_index - right.column_index),
+      } : currentRow),
+      uncertain_fields: [...new Set([...(currentTable.uncertain_fields || []), 'manual_cell_merge'])],
+    }))
+    setSelectedCellKeys(new Set([`${tableId}:${mergedCell.id}`]))
+  }
+
+  const splitTableCell = (tableId, cellId) => {
+    updateTable(tableId, (table) => {
+      const sourceRowIndex = table.rows.findIndex((row) => row.cells.some((item) => item.id === cellId))
+      const sourceCell = table.rows[sourceRowIndex]?.cells.find((item) => item.id === cellId)
+      if (!sourceCell) return table
+      const rowspan = Math.max(1, Number(sourceCell.rowspan || 1))
+      const colspan = Math.max(1, Number(sourceCell.colspan || 1))
+      if (rowspan <= 1 && colspan <= 1) return table
+      const mergedParts = Array.isArray(sourceCell.merged_parts) ? sourceCell.merged_parts : []
+      const originalMergedText = mergedParts.map((part) => part.text || '').join('\n')
+      const hasCorrection = Boolean(sourceCell.corrected) || (mergedParts.length > 0 && sourceCell.text !== originalMergedText)
+      const cellWidth = Math.max(1, Number(sourceCell.bbox[2]) - Number(sourceCell.bbox[0])) / colspan
+      const cellHeight = Math.max(1, Number(sourceCell.bbox[3]) - Number(sourceCell.bbox[1])) / rowspan
+      const startRow = Number(sourceCell.row_index ?? sourceRowIndex)
+      const startColumn = Number(sourceCell.column_index || 0)
+      const replacementsByRow = new Map()
+      for (let rowOffset = 0; rowOffset < rowspan; rowOffset += 1) {
+        const replacements = []
+        for (let columnOffset = 0; columnOffset < colspan; columnOffset += 1) {
+          const part = rowOffset === 0 && !hasCorrection ? mergedParts[columnOffset] : null
+          replacements.push({
+            ...(part || sourceCell),
+            id: part?.id || `split-${Date.now()}-${rowOffset}-${columnOffset}`,
+            row_index: startRow + rowOffset,
+            column_index: startColumn + columnOffset,
+            text: part ? part.text : (rowOffset === 0 && columnOffset === 0 ? sourceCell.text : ''),
+            original_text: part ? part.original_text : (rowOffset === 0 && columnOffset === 0 ? sourceCell.original_text : ''),
+            corrected: hasCorrection && rowOffset === 0 && columnOffset === 0,
+            rowspan: 1,
+            colspan: 1,
+            merged_parts: undefined,
+            bbox: [
+              Number(sourceCell.bbox[0]) + cellWidth * columnOffset,
+              Number(sourceCell.bbox[1]) + cellHeight * rowOffset,
+              columnOffset === colspan - 1 ? sourceCell.bbox[2] : Number(sourceCell.bbox[0]) + cellWidth * (columnOffset + 1),
+              rowOffset === rowspan - 1 ? sourceCell.bbox[3] : Number(sourceCell.bbox[1]) + cellHeight * (rowOffset + 1),
+            ],
+          })
+        }
+        replacementsByRow.set(startRow + rowOffset, replacements)
+      }
+      return {
+        ...table,
+        rows: table.rows.map((row, rowIndex) => {
+          const logicalRow = Number(row.index ?? rowIndex)
+          const rowReplacements = replacementsByRow.get(logicalRow)
+          if (!rowReplacements) return row
+          const remainingCells = row.cells.filter((cell) => cell.id !== cellId && !(
+            Number(cell.column_index || 0) >= startColumn
+            && Number(cell.column_index || 0) < startColumn + colspan
+          ))
+          return { ...row, cells: [...remainingCells, ...rowReplacements].sort((left, right) => left.column_index - right.column_index) }
+        }),
+        uncertain_fields: [...new Set([...(table.uncertain_fields || []), 'manual_cell_split'])],
+      }
+    })
+  }
+
+  const compareTableOnPage = (table) => {
+    setSelectedTableKeys((current) => new Set([...current, table.id]))
+    const page = ocrPages.find((item) => Number(item.page_number) === Number(table.page_number))
+    const tokens = (page?.lines || []).flatMap((line) => line.tokens || [])
+    const matchingToken = tokens.find((token) => boxesOverlap(table.bbox, token.bbox))
+    const element = matchingToken ? tokenRefs.current.get(`${page.page_number}:${matchingToken.token_index}`) : null
+    element?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }
+
   const toggleReviewSelection = (attributeKey) => {
     setSelectedReviewKeys((current) => {
       const next = new Set(current)
@@ -1741,16 +2200,48 @@ function ViewerPage({
 
   const saveSelectedReviewAttributes = async () => {
     const selectedAttributes = reviewAttributes.filter((attribute) => selectedReviewKeys.has(getAttributeKey(attribute)))
-    if (!selectedAttributes.length) {
-      setReviewError('Select at least one attribute to save.')
+    const selectedTableItems = detectedTables.flatMap((table) => {
+      const tableCells = (table.rows || []).flatMap((row) => row.cells || [])
+      const hasSelectedCells = tableCells.some((cell) => selectedCellKeys.has(`${table.id}:${cell.id}`))
+      if (!selectedTableKeys.has(table.id) && !hasSelectedCells) return []
+      const tableText = table.rows.map((row) => (row.cells || []).map((cell) => cell.text || '').join('\t')).join('\n')
+      return [{
+        temp_id: `table-${table.id}`,
+        kind: 'table',
+        metadata: { ...table, kind: 'table', version: 1 },
+        source: 'model',
+        entity_type_label: table.title || 'Table',
+        extracted_value: tableText || table.title || 'Table',
+        page_number: table.page_number || 1,
+        page_id: table.page_id,
+        bounding_boxes: table.bounding_boxes || [table.bbox].filter(Boolean),
+        page_spans: [{ page_number: table.page_number || 1, bounding_boxes: table.bounding_boxes || [table.bbox].filter(Boolean) }],
+        confidence_score: table.confidence_score || 0,
+        draft_label: table.title || 'Table',
+        draft_value: tableText || table.title || 'Table',
+      }]
+    })
+    const selectedFieldItems = allTextFieldEntries.filter((attribute) => selectedTextFieldKeys.has(getAttributeKey(attribute))).map((attribute) => ({
+      ...attribute,
+      temp_id: attribute.temp_id || `field-${attribute.id || Date.now()}`,
+      draft_label: attribute.draft_label || attribute.entity_type_label,
+      draft_value: attribute.draft_value || attribute.extracted_value,
+    }))
+
+    const combinedSelection = [...selectedAttributes, ...selectedTableItems, ...selectedCellItems, ...selectedFieldItems]
+    if (!combinedSelection.length) {
+      setReviewError('Select at least one table or field to save.')
       return
     }
 
     setSavingSelected(true)
     setReviewError('')
     try {
-      await onSaveSelectedAttributes?.(selectedAttributes)
+      await onSaveSelectedAttributes?.(combinedSelection)
       setSelectedReviewKeys(new Set())
+      setSelectedTableKeys(new Set())
+      setSelectedCellKeys(new Set())
+      setSelectedTextFieldKeys(new Set())
     } catch (error) {
       setReviewError(error.message)
     } finally {
@@ -1777,11 +2268,171 @@ function ViewerPage({
     if (!viewerQuery) {
       return reviewAttributes
     }
-    return reviewAttributes.filter((attribute) => {
+    return reviewAttributes.filter((attribute) => attribute.kind !== 'table').filter((attribute) => {
       const haystack = `${attribute.draft_label} ${attribute.draft_value} ${attribute.draft_validation_status}`.toLowerCase()
       return haystack.includes(viewerQuery)
     })
   }, [reviewAttributes, viewerQuery])
+
+  const bulletEntries = useMemo(() => {
+    const entries = []
+    for (const page of ocrPages || []) {
+      const pageLines = Array.isArray(page?.lines) ? page.lines : []
+      for (const line of pageLines) {
+        const rawText = String(line?.text || '').trim()
+        if (!rawText) {
+          continue
+        }
+
+        const bulletMatch = rawText.match(/^(\s*(?:[-*•]|\d+[.)]|[A-Za-z][.)])\s+)(.+)$/)
+        const normalized = (bulletMatch ? bulletMatch[2] : rawText).replace(/\s+/g, ' ').trim()
+        if (!normalized || normalized.length < 2) {
+          continue
+        }
+
+        const itemText = bulletMatch ? `${bulletMatch[1].trim() || '•'} ${normalized}` : `• ${normalized}`
+        const confidenceValues = (line.tokens || []).map((token) => Number(token.confidence)).filter((value) => Number.isFinite(value))
+        entries.push({
+          id: `${page.page_number}:${line.id || rawText}`,
+          pageNumber: page.page_number,
+          pageId: page.page_id,
+          bounding_boxes: (line.tokens || []).map((token) => token.bbox).filter((bbox) => Array.isArray(bbox) && bbox.length === 4),
+          confidence_score: confidenceValues.length ? confidenceValues.reduce((sum, value) => sum + value, 0) / confidenceValues.length / 100 : 0,
+          text: itemText,
+        })
+      }
+    }
+
+    if (!entries.length) {
+      for (const page of ocrPages || []) {
+        const pageText = String(page?.text || '').trim()
+        if (!pageText) {
+          continue
+        }
+        for (const paragraph of pageText.split(/\n+/)) {
+          const cleanText = paragraph.replace(/\s+/g, ' ').trim()
+          if (cleanText && cleanText.length >= 2) {
+            entries.push({
+              id: `${page.page_number}:${cleanText}`,
+              pageNumber: page.page_number,
+              pageId: page.page_id,
+              bounding_boxes: [],
+              confidence_score: 0,
+              text: `• ${cleanText}`,
+            })
+          }
+        }
+      }
+    }
+
+    return entries
+  }, [ocrPages])
+
+  const bulletFieldEntry = useMemo(() => {
+    if (!bulletEntries.length) {
+      return null
+    }
+    const extractedValue = bulletEntries.map((entry) => entry.text).join('\n')
+    return {
+      temp_id: 'detected-bulleted-text',
+      entity_type_label: 'Detected bullet list',
+      extracted_value: extractedValue,
+      original_prediction: extractedValue,
+      draft_label: 'Detected bullet list',
+      draft_value: bulletFieldDraft || extractedValue,
+      original_label: 'Detected bullet list',
+      original_value: extractedValue,
+      draft_validation_status: 'PENDING',
+      validation_status: 'PENDING',
+      confidence_score: bulletEntries.length
+        ? bulletEntries.reduce((sum, entry) => sum + Number(entry.confidence_score || 0), 0) / bulletEntries.length
+        : 0,
+      source: 'model',
+      kind: 'text_field',
+      saved: false,
+      page_number: bulletEntries[0]?.pageNumber || 1,
+      page_id: bulletEntries[0]?.pageId,
+      bounding_boxes: bulletEntries.flatMap((entry) => entry.bounding_boxes || []),
+      page_spans: bulletEntries.reduce((spans, entry) => {
+        const existing = spans.find((span) => Number(span.page_number) === Number(entry.pageNumber))
+        if (existing) {
+          existing.bounding_boxes.push(...(entry.bounding_boxes || []))
+        } else {
+          spans.push({ page_number: entry.pageNumber, bounding_boxes: [...(entry.bounding_boxes || [])] })
+        }
+        return spans
+      }, []),
+    }
+  }, [bulletEntries, bulletFieldDraft])
+
+  useEffect(() => {
+    setBulletFieldDraft(bulletEntries.map((entry) => entry.text).join('\n'))
+  }, [bulletEntries])
+
+  const allTextFieldEntries = useMemo(
+    () => (bulletFieldEntry ? [...textFieldEntries, bulletFieldEntry] : textFieldEntries),
+    [bulletFieldEntry, textFieldEntries],
+  )
+
+  const extractedBulletText = bulletEntries.map((entry) => entry.text).join('\n')
+
+  const [copyStatus, setCopyStatus] = useState('')
+  const [readStatus, setReadStatus] = useState('')
+
+  useEffect(() => {
+    return () => {
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel()
+      }
+    }
+  }, [])
+
+  const handleCopyBullets = async () => {
+    if (!extractedBulletText) {
+      setCopyStatus('No bulleted text available yet.')
+      return
+    }
+
+    try {
+      await navigator.clipboard.writeText(extractedBulletText)
+      setCopyStatus('Bulleted text copied to clipboard.')
+    } catch (error) {
+      const textarea = document.createElement('textarea')
+      textarea.value = extractedBulletText
+      textarea.setAttribute('readonly', 'true')
+      textarea.style.position = 'fixed'
+      textarea.style.opacity = '0'
+      document.body.appendChild(textarea)
+      textarea.select()
+      document.execCommand('copy')
+      document.body.removeChild(textarea)
+      setCopyStatus('Bulleted text copied.')
+    }
+
+    window.setTimeout(() => setCopyStatus(''), 1800)
+  }
+
+  const handleReadBullets = () => {
+    if (!extractedBulletText) {
+      setReadStatus('No bulleted text to read.')
+      return
+    }
+
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      setReadStatus('Speech playback is not available in this browser.')
+      return
+    }
+
+    window.speechSynthesis.cancel()
+    const utterance = new SpeechSynthesisUtterance(extractedBulletText)
+    utterance.rate = 0.9
+    utterance.pitch = 1
+    utterance.lang = 'en-US'
+    utterance.onend = () => setReadStatus('Finished reading bulleted text.')
+    utterance.onerror = () => setReadStatus('Unable to read the bulleted text.')
+    window.speechSynthesis.speak(utterance)
+    setReadStatus('Reading bulleted text...')
+  }
 
   if (viewerLoading) {
     return (
@@ -1801,8 +2452,8 @@ function ViewerPage({
   }
 
   return (
-    <div className="grid gap-6 px-4 pb-8 pt-6 lg:grid-cols-[minmax(0,1.5fr)_minmax(340px,0.9fr)] lg:px-8">
-      <section className="overflow-hidden rounded-[30px] border border-slate-200 bg-white shadow-[0_10px_30px_rgba(15,23,42,0.05)]">
+    <div className="grid gap-6 px-4 pb-8 pt-6 lg:h-[calc(100dvh-6rem)] lg:min-h-0 lg:grid-cols-[minmax(0,1.5fr)_minmax(340px,0.9fr)] lg:overflow-hidden lg:px-8">
+      <section className="overflow-hidden rounded-[30px] border border-slate-200 bg-white shadow-[0_10px_30px_rgba(15,23,42,0.05)] lg:flex lg:min-h-0 lg:flex-col">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-4 sm:px-6">
           <div>
             <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">Document Viewer</p>
@@ -1823,7 +2474,7 @@ function ViewerPage({
           </div>
         </div>
 
-        <div className="max-h-[calc(100vh-250px)] overflow-auto bg-slate-50/60 p-4 sm:p-6">
+        <div className="bg-slate-50/60 p-4 sm:p-6 lg:min-h-0 lg:flex-1 lg:overflow-y-auto">
           <div className="space-y-5">
             {ocrPages.length ? (
               ocrPages.map((page) => (
@@ -1839,7 +2490,7 @@ function ViewerPage({
                   </div>
 
                   <div className="p-5 sm:p-6">
-                    <div className="overflow-auto rounded-2xl border border-slate-200 bg-slate-100 p-3">
+                    <div className="overflow-x-auto overflow-y-hidden rounded-2xl border border-slate-200 bg-slate-100 p-3">
                       <div className="relative mx-auto" style={{ width: `${zoom}%`, minWidth: '680px' }}>
                         {page.image_url ? (
                           <AuthenticatedPageImage
@@ -1869,13 +2520,21 @@ function ViewerPage({
                               const height = `${Math.max(0.7, ((y1 - y0) / 1000) * 100)}%`
                               const isMatchedAttribute = tokenToAttribute.has(tokenKey)
                               const isSelectedAttribute = selectedTokenKeys.includes(tokenKey)
+                              const isSelectedTableRegion = selectedTableTokenKeys.has(tokenKey)
+                              const tokenConfidence = Number(token.confidence || 0)
+                              const confidenceClass = tokenConfidence >= 90
+                                ? 'token-confidence-high'
+                                : tokenConfidence >= 75
+                                  ? 'token-confidence-medium'
+                                  : 'token-confidence-low'
                               const isSearchHit = viewerQuery && token.token.toLowerCase().includes(viewerQuery)
                               const tokenClasses = [
                                 'absolute select-text whitespace-nowrap leading-none rounded px-0.5 transition-all cursor-pointer',
                                 'text-transparent selection:bg-amber-200/80 selection:text-slate-900',
+                                confidenceClass,
                                 isMatchedAttribute ? 'hover:bg-blue-200/45' : 'hover:bg-slate-200/35',
                                 isSearchHit ? 'token-highlight' : '',
-                                isSelectedAttribute ? 'token-highlight-active' : '',
+                                isSelectedAttribute || isSelectedTableRegion ? 'token-highlight-active' : '',
                               ]
                                 .filter(Boolean)
                                 .join(' ')
@@ -1919,8 +2578,8 @@ function ViewerPage({
         </div>
       </section>
 
-      <aside className="overflow-hidden rounded-[30px] border border-slate-200 bg-white shadow-[0_10px_30px_rgba(15,23,42,0.05)]">
-        <div className="border-b border-slate-200 px-5 py-4 sm:px-6">
+      <aside className="overflow-hidden rounded-[30px] border border-slate-200 bg-white shadow-[0_10px_30px_rgba(15,23,42,0.05)] lg:flex lg:min-h-0 lg:flex-col">
+        <div className="border-b border-slate-200 px-5 py-4 sm:px-6 lg:shrink-0">
           <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">Attributes</p>
           <h2 className="mt-1 text-xl font-semibold text-slate-900">Extracted fields</h2>
           <p className="mt-1 text-sm text-slate-500">Edit labels and values, then save changes back to the database.</p>
@@ -1931,7 +2590,7 @@ function ViewerPage({
           ) : null}
         </div>
 
-        <div className="max-h-[calc(100vh-250px)] space-y-4 overflow-auto p-4 sm:p-6">
+        <div className="space-y-4 overflow-y-visible p-4 sm:p-6 lg:min-h-0 lg:flex-1 lg:overflow-y-auto">
           <section className="rounded-[20px] border border-slate-200 bg-slate-50/80 p-4">
             <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Confidence legend</p>
             <div className="mt-3 grid gap-2 text-xs text-slate-700">
@@ -1991,7 +2650,111 @@ function ViewerPage({
             <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{reviewError}</div>
           ) : null}
 
-          {isDraftReview ? (
+          <div className="rounded-[22px] border border-slate-200 bg-slate-50 p-1">
+            <div className="flex gap-1">
+              <button type="button" onClick={() => setActivePanelTab('tables')} className={`flex-1 rounded-xl px-3 py-2 text-sm font-semibold transition ${activePanelTab === 'tables' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-white'}`}>
+                Tables
+              </button>
+              <button type="button" onClick={() => setActivePanelTab('text-fields')} className={`flex-1 rounded-xl px-3 py-2 text-sm font-semibold transition ${activePanelTab === 'text-fields' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-white'}`}>
+                Text Fields
+              </button>
+            </div>
+          </div>
+
+          {activePanelTab === 'tables' ? (
+            <section className="space-y-4">
+              {detectedTables.length ? (
+                detectedTables.map((table) => (
+                  <ReconstructedTableCard
+                    key={table.id}
+                    table={table}
+                    selected={selectedTableKeys.has(table.id)}
+                    selectedCellKeys={selectedCellKeys}
+                    onToggleTable={toggleTableSelection}
+                    onToggleCell={toggleCellSelection}
+                    onEditCell={editTableCell}
+                    onToggleHeader={toggleTableHeader}
+                    onEditTitle={(tableId, title) => updateTable(tableId, (current) => ({ ...current, title }))}
+                    onEditCaption={(tableId, caption) => updateTable(tableId, (current) => ({ ...current, caption }))}
+                    onCompare={compareTableOnPage}
+                    onAddRow={addTableRow}
+                    onRemoveRow={removeTableRow}
+                    onAddColumn={addTableColumn}
+                    onRemoveColumn={removeTableColumn}
+                    onMergeCells={mergeSelectedTableCells}
+                    onSplitCell={splitTableCell}
+                  />
+                ))
+              ) : (
+                <div className="rounded-[24px] border border-dashed border-slate-200 bg-slate-50 px-4 py-12 text-center text-sm text-slate-500">
+                  No confident table layout was detected. This view only shows structures supported by page rules or repeated OCR column alignment.
+                </div>
+              )}
+            </section>
+          ) : (
+            <section className="space-y-4">
+              {allTextFieldEntries.length ? (
+                allTextFieldEntries.map((attribute) => {
+                  const fieldKey = getAttributeKey(attribute)
+                  const selected = selectedTextFieldKeys.has(fieldKey)
+                  const isBulletField = attribute.temp_id === 'detected-bulleted-text'
+                  return (
+                    <section key={fieldKey} className={`rounded-[24px] border-2 p-4 ${confidenceBorderTone(Number(attribute.confidence_score || 0))} ${selected ? 'bg-blue-50 ring-2 ring-blue-200' : ''}`}>
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Text field</p>
+                          <p className="mt-1 text-base font-semibold text-slate-900">{attribute.draft_label}</p>
+                        </div>
+                        <label className="flex items-center gap-2 text-xs text-slate-600">
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            onChange={() => {
+                              setSelectedTextFieldKeys((current) => {
+                                const next = new Set(current)
+                                if (next.has(fieldKey)) next.delete(fieldKey)
+                                else next.add(fieldKey)
+                                return next
+                              })
+                            }}
+                          />
+                          Select
+                        </label>
+                      </div>
+
+                      <div className="mt-3 space-y-3">
+                        <label className="block space-y-2">
+                          <span className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Label</span>
+                          <input
+                            value={attribute.draft_label}
+                            onChange={(event) => isBulletField ? undefined : updateReviewAttribute(fieldKey, 'draft_label', event.target.value)}
+                            className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none"
+                          />
+                        </label>
+                        <label className="block space-y-2">
+                          <span className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Value</span>
+                          <textarea
+                            value={isBulletField ? bulletFieldDraft : attribute.draft_value}
+                            rows={3}
+                            onChange={(event) => isBulletField ? setBulletFieldDraft(event.target.value) : updateReviewAttribute(fieldKey, 'draft_value', event.target.value)}
+                            className="w-full resize-y rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none"
+                          />
+                        </label>
+                      </div>
+                    </section>
+                  )
+                })
+              ) : (
+                <div className="rounded-[24px] border border-dashed border-slate-200 bg-slate-50 px-4 py-12 text-center text-sm text-slate-500">
+                  No text fields were extracted for this document yet.
+                </div>
+              )}
+            </section>
+          )}
+
+          {activePanelTab === 'text-fields' ? (
+            <>
+              {isDraftReview ? (
             <section className="rounded-[24px] border border-slate-200 bg-slate-50 p-4">
               <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Add Attribute</p>
               <div className="mt-3 grid gap-3">
@@ -2023,9 +2786,9 @@ function ViewerPage({
                 </div>
               </div>
             </section>
-          ) : null}
+              ) : null}
 
-          {filteredAttributes.length ? (
+              {filteredAttributes.length ? (
             filteredAttributes.map((attribute) => {
               const attributeKey = getAttributeKey(attribute)
               const isSelected = isDraftReview ? selectedReviewKeys.has(attributeKey) : selectedAttributeId === attribute.id
@@ -2114,11 +2877,13 @@ function ViewerPage({
                 </section>
               )
             })
-          ) : (
+              ) : (
             <div className="rounded-[24px] border border-dashed border-slate-200 bg-slate-50 px-4 py-14 text-center text-sm text-slate-500">
               {viewerQuery ? 'No attributes match the current search.' : 'No attributes were extracted for this document yet.'}
             </div>
-          )}
+              )}
+            </>
+          ) : null}
 
           {isDraftReview ? (
             <div className="sticky bottom-0 rounded-[24px] border border-slate-200 bg-white p-4 shadow-sm">
@@ -3184,6 +3949,8 @@ export default function App() {
           page_spans: attribute.page_spans || [],
           confidence_score: attribute.confidence_score || 0,
           validation_status: attribute.draft_validation_status || attribute.validation_status || 'PENDING',
+          kind: attribute.kind,
+          metadata: attribute.kind === 'table' ? (attribute.metadata || attribute.table_data) : attribute.metadata,
         })),
       }),
     })

@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import time
 import threading
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 import uuid
@@ -32,11 +33,16 @@ from app.model_inference import LayoutLMv3InferenceService
 from app.models import Attribute, Document as DocumentRecord, Page
 from app.ocr_processor import extract_tokens_with_bboxes
 from app.routing_engine import build_attribute_payloads, build_ocr_baseline_payloads
+from app.table_reconstruction import reconstruct_tables
 from app.tasks import celery_app
 from app.storage import delete_file, download_file, storage_enabled, upload_file
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+_OCR_PAGE_CACHE: OrderedDict[tuple[int, str, int], tuple[list[dict[str, Any]], dict[str, Any]]] = OrderedDict()
+_OCR_PAGE_LOCKS: dict[tuple[int, str, int], threading.Lock] = {}
+_OCR_PAGE_CACHE_LOCK = threading.Lock()
+_OCR_PAGE_CACHE_LIMIT = 128
 
 SUPPORTED_FORMATS = {
     ".pdf": {"application/pdf"},
@@ -366,6 +372,36 @@ def list_documents(user_id: CurrentUserId, q: str | None = Query(None), limit: i
     return {"documents": summaries, "query": q or ""}
 
 
+def _get_page_ocr_data(page: Page, image_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    image_stat = image_path.stat()
+    cache_key = (page.id, str(image_path.resolve()), image_stat.st_mtime_ns)
+    with _OCR_PAGE_CACHE_LOCK:
+        cached = _OCR_PAGE_CACHE.get(cache_key)
+        if cached is not None:
+            _OCR_PAGE_CACHE.move_to_end(cache_key)
+            return cached
+        page_lock = _OCR_PAGE_LOCKS.setdefault(cache_key, threading.Lock())
+
+    try:
+        with page_lock:
+            with _OCR_PAGE_CACHE_LOCK:
+                cached = _OCR_PAGE_CACHE.get(cache_key)
+                if cached is not None:
+                    _OCR_PAGE_CACHE.move_to_end(cache_key)
+                    return cached
+            tokens = extract_tokens_with_bboxes(image_path)
+            table_layout = reconstruct_tables(image_path, tokens, page.id, page.page_number)
+            with _OCR_PAGE_CACHE_LOCK:
+                _OCR_PAGE_CACHE[cache_key] = (tokens, table_layout)
+                _OCR_PAGE_CACHE.move_to_end(cache_key)
+                while len(_OCR_PAGE_CACHE) > _OCR_PAGE_CACHE_LIMIT:
+                    _OCR_PAGE_CACHE.popitem(last=False)
+            return tokens, table_layout
+    finally:
+        with _OCR_PAGE_CACHE_LOCK:
+            _OCR_PAGE_LOCKS.pop(cache_key, None)
+
+
 @router.get("/documents/{document_id}/ocr")
 def get_document_ocr(document_id: int, user_id: CurrentUserId, db: Session = Depends(get_db)) -> dict[str, Any]:
     document = db.query(DocumentRecord).filter(DocumentRecord.id == document_id, owner_scope(DocumentRecord.owner_id, user_id)).first()
@@ -380,7 +416,7 @@ def get_document_ocr(document_id: int, user_id: CurrentUserId, db: Session = Dep
         if not image_path.exists():
             raise HTTPException(status_code=404, detail=f"Rasterized page missing for page {page.page_number}")
 
-        tokens = extract_tokens_with_bboxes(image_path)
+        tokens, table_layout = _get_page_ocr_data(page, image_path)
         lines_by_key: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
         for token_index, token in enumerate(tokens):
             key = (
@@ -411,6 +447,9 @@ def get_document_ocr(document_id: int, user_id: CurrentUserId, db: Session = Dep
                 "text": "\n".join(line["text"] for line in lines),
                 "lines": lines,
                 "tokens": tokens,
+                "page_width": table_layout["page_width"],
+                "page_height": table_layout["page_height"],
+                "tables": table_layout["tables"],
             }
         )
 

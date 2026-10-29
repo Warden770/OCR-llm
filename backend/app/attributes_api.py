@@ -21,6 +21,17 @@ router = APIRouter()
 VALIDATED_STATUSES = {"APPROVED", "VALIDATED", "CORRECTED"}
 
 
+def _table_structure(value: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict) or parsed.get("kind") != "table":
+        return None
+    table = parsed.get("table")
+    return table if isinstance(table, dict) else parsed
+
+
 class CorrectionItem(BaseModel):
     attribute_id: int = Field(..., ge=1)
     original_prediction: str
@@ -48,6 +59,8 @@ class SelectedAttributeItem(BaseModel):
     page_spans: list[dict[str, Any]] = Field(default_factory=list)
     confidence_score: float = 0.0
     validation_status: str = "PENDING"
+    kind: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class SaveSelectedAttributesRequest(BaseModel):
@@ -87,7 +100,8 @@ def _load_export_rows(document_id: int, db: Session) -> tuple[Document, list[dic
                 "validation_status": attribute.validation_status,
                 "bounding_boxes": attribute.bounding_boxes,
                 "page_spans": attribute.page_spans,
-                "page_spans": attribute.page_spans,
+                "kind": "table" if _table_structure(attribute.extracted_value) else None,
+                "table_structure": _table_structure(attribute.extracted_value),
             }
         )
 
@@ -109,6 +123,8 @@ def _rows_to_csv(rows: list[dict[str, Any]]) -> str:
         "validation_status",
         "bounding_boxes",
         "page_spans",
+        "kind",
+        "table_structure",
     ]
     writer = csv.DictWriter(buffer, fieldnames=fieldnames)
     writer.writeheader()
@@ -116,6 +132,7 @@ def _rows_to_csv(rows: list[dict[str, Any]]) -> str:
         csv_row = dict(row)
         csv_row["bounding_boxes"] = json.dumps(row["bounding_boxes"], ensure_ascii=False)
         csv_row["page_spans"] = json.dumps(row["page_spans"], ensure_ascii=False)
+        csv_row["table_structure"] = json.dumps(row["table_structure"], ensure_ascii=False) if row["table_structure"] else ""
         writer.writerow(csv_row)
     return buffer.getvalue()
 
@@ -207,11 +224,25 @@ def save_selected_attributes(document_id: int, payload: SaveSelectedAttributesRe
 
             if page_id not in {page.id for page in document.pages}:
                 raise HTTPException(status_code=403, detail="Page does not belong to document")
+
+            normalized_label = item.entity_type_label.strip()
+            normalized_value = item.extracted_value.strip()
+            if item.kind == "table" and item.metadata:
+                table_structure = {**item.metadata, "kind": "table", "version": item.metadata.get("version", 1)}
+                normalized_label = str(table_structure.get("title") or item.entity_type_label).strip() or normalized_label
+                normalized_value = json.dumps(
+                    {"kind": "table", "version": table_structure["version"], "table": table_structure},
+                    ensure_ascii=False,
+                )
+            elif item.kind == "text_field" and item.metadata:
+                normalized_label = str(item.metadata.get("label") or item.entity_type_label).strip() or normalized_label
+                normalized_value = str(item.metadata.get("value") or item.extracted_value).strip()
+
             saved_attribute = Attribute(
                 page_id=page_id,
                 document_id=document.id,
-                entity_type_label=item.entity_type_label.strip(),
-                extracted_value=item.extracted_value.strip(),
+                entity_type_label=normalized_label,
+                extracted_value=normalized_value,
                 bounding_boxes=item.bounding_boxes or (staged_row.get("bounding_boxes") if staged_row else []),
                 page_spans=item.page_spans or (staged_row.get("page_spans") if staged_row else []),
                 confidence_score=float(item.confidence_score if item.source == "manual" else (staged_row.get("confidence_score", item.confidence_score) if staged_row else item.confidence_score)),
@@ -269,6 +300,8 @@ def get_attribute_detail(attribute_id: int, user_id: CurrentUserId, db: Session 
             "validation_status": attribute.validation_status,
             "bounding_boxes": attribute.bounding_boxes,
             "page_spans": attribute.page_spans,
+            "kind": "table" if _table_structure(attribute.extracted_value) else None,
+            "table_structure": _table_structure(attribute.extracted_value),
         }
     }
 
