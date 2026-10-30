@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.db import SessionLocal, get_db, set_rls_user
 from app.auth import CurrentUserId, owner_scope
 from app.document_schemas import classify_document_type
-from app.llm_extractor import LLMExtractionError, LLMExtractionService, build_llm_payloads, get_extraction_backend
+from app.llm_extractor import LLMExtractionError, build_llm_payloads, create_extraction_service, get_extraction_backend
 from app.models import Attribute, Document as DocumentRecord, Page
 from app.ocr_processor import extract_tokens_with_bboxes
 from app.routing_engine import build_ocr_baseline_payloads
@@ -1022,9 +1022,10 @@ def _build_attribute_payloads_for_page(
     if not tokens:
         return []
 
-    if get_extraction_backend() == "llm":
+    backend = get_extraction_backend()
+    if backend in {"llm", "gemini"}:
         try:
-            extraction = LLMExtractionService().extract_page(image_path, tokens, document_type)
+            extraction = create_extraction_service(backend).extract_page(image_path, tokens, document_type)
             return build_llm_payloads(extraction, tokens, page_id=page_id, document_id=document_id)
         except LLMExtractionError as exc:
             logger.warning("LLM extraction failed for %s; using OCR baseline: %s", image_path, exc)

@@ -70,7 +70,7 @@ def test_generated_prediction_keys_match_page_based_ground_truth(tmp_path, monke
                 fields=[ExtractedField(label="TOTAL", value="Total", token_indices=[0], confidence=1.0)],
             )
 
-    monkeypatch.setattr(dataset_tools, "LLMExtractionService", FakeExtractor)
+    monkeypatch.setattr(dataset_tools, "create_extraction_service", lambda model=None: FakeExtractor(model))
     predictions_path = tmp_path / "predictions.jsonl"
     assert dataset_tools.generate_predictions(raw_folder, predictions_path) == 1
 

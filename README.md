@@ -1,6 +1,6 @@
 # OCR Attribute Extraction System
 
-An AI-based pipeline that ingests non-standard documents, rasterizes them at 300 DPI, classifies the document type, reads the text with Tesseract, and extracts the fields defined for that document type with a multimodal LLM (Claude). Every extracted value is tied back to the OCR tokens it came from, and low-confidence fields are routed to human review.
+An AI-based pipeline that ingests non-standard documents, rasterizes them at 300 DPI, classifies the document type, reads the text with Tesseract, and extracts the fields defined for that document type with a multimodal LLM (Claude or Gemini). Every extracted value is tied back to the OCR tokens it came from, and low-confidence fields are routed to human review.
 
 ## How extraction works
 
@@ -16,7 +16,7 @@ There is no model training. Behaviour is changed by editing the prompt in `llm_e
 ## Stack
 
 - Python 3.10
-- Anthropic API (Claude, multimodal) for extraction
+- Anthropic API (Claude) or Gemini API, both multimodal, for extraction
 - Tesseract OCR v5
 - OpenCV
 - PyMuPDF (fitz)
@@ -54,11 +54,13 @@ If port 8000 is already occupied, the preflight check exits with a clear message
 | Variable | Purpose |
 |---|---|
 | `ANTHROPIC_API_KEY` | Enables LLM extraction. Keep it server-side (backend and worker only). |
-| `EXTRACTION_BACKEND` | `llm` or `ocr`. Blank means `llm` when a key is set, otherwise `ocr`. |
+| `GEMINI_API_KEY` | Enables the Gemini backend. A free key from Google AI Studio works; a Google AI Pro/Plus subscription does not include API access. |
+| `GEMINI_EXTRACTION_MODEL`, `GEMINI_TIMEOUT_SECONDS` | Gemini model (default `gemini-2.5-flash`) and request timeout (60). |
+| `EXTRACTION_BACKEND` | `llm` (Claude), `gemini` or `ocr`. Blank means Claude if `ANTHROPIC_API_KEY` is set, else Gemini if `GEMINI_API_KEY` is set, else `ocr`. |
 | `LLM_EXTRACTION_MODEL` | Model ID, default `claude-sonnet-5-5`. |
 | `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES` | Request timeout (120) and retry count (3). |
 
-Privacy note: with the LLM backend, page images and OCR text are sent to the Anthropic API. Use `EXTRACTION_BACKEND=ocr` for documents that must not leave your environment.
+Privacy note: with an LLM backend, page images and OCR text are sent to Anthropic or Google. Gemini free-tier requests may be used by Google to improve its products, so do not use the free tier for confidential documents. Use `EXTRACTION_BACKEND=ocr` for documents that must not leave your environment.
 
 ## Run The System
 

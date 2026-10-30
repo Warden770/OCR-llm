@@ -122,10 +122,14 @@ def test_label_tokens_marks_unlabeled_tokens_as_outside(page_image) -> None:
 
 
 def test_backend_selection(monkeypatch) -> None:
-    monkeypatch.delenv("EXTRACTION_BACKEND", raising=False)
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    for name in ("EXTRACTION_BACKEND", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
     assert get_extraction_backend() == "ocr"
+    monkeypatch.setenv("GEMINI_API_KEY", "key")
+    assert get_extraction_backend() == "gemini"
     monkeypatch.setenv("ANTHROPIC_API_KEY", "key")
-    assert get_extraction_backend() == "llm"
+    assert get_extraction_backend() == "llm"  # Claude wins when both are set
+    monkeypatch.setenv("EXTRACTION_BACKEND", "gemini")
+    assert get_extraction_backend() == "gemini"
     monkeypatch.setenv("EXTRACTION_BACKEND", "ocr")
     assert get_extraction_backend() == "ocr"

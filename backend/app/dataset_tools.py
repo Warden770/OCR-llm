@@ -10,7 +10,7 @@ from xml.etree import ElementTree as ET
 
 from PIL import Image
 
-from app.llm_extractor import LLMExtractionService, label_tokens
+from app.llm_extractor import create_extraction_service, label_tokens
 from app.ocr_processor import extract_tokens_with_bboxes
 
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff"}
@@ -129,7 +129,7 @@ def generate_predictions(raw_folder: str | Path, output: str | Path, model: str 
     root = Path(raw_folder)
     if not root.is_dir():
         raise FileNotFoundError(f"Raw image folder not found: {root}")
-    extractor = LLMExtractionService(model=model)
+    extractor = create_extraction_service(model=model)
     records: list[dict[str, Any]] = []
     for image_path in sorted(path for path in root.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS):
         relative_id = image_path.relative_to(root).with_suffix("").as_posix()

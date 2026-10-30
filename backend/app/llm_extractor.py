@@ -66,15 +66,34 @@ def llm_is_configured() -> bool:
 
 
 def get_extraction_backend() -> str:
-    """Return ``"llm"`` or ``"ocr"``.
+    """Return ``"llm"`` (Claude), ``"gemini"`` or ``"ocr"``.
 
-    ``EXTRACTION_BACKEND`` forces a choice; otherwise the LLM is used when an
-    API key is present and plain OCR heuristics are used when it is not.
+    ``EXTRACTION_BACKEND`` forces a choice. Otherwise Claude is used when
+    ``ANTHROPIC_API_KEY`` is set, Gemini when only ``GEMINI_API_KEY`` is set,
+    and plain OCR heuristics when neither is.
     """
     forced = os.getenv("EXTRACTION_BACKEND", "").strip().lower()
-    if forced in {"llm", "ocr"}:
+    if forced == "claude":
+        return "llm"
+    if forced in {"llm", "gemini", "ocr"}:
         return forced
-    return "llm" if llm_is_configured() else "ocr"
+    if llm_is_configured():
+        return "llm"
+    if os.getenv("GEMINI_API_KEY", "").strip():
+        return "gemini"
+    return "ocr"
+
+
+def create_extraction_service(backend: str | None = None, model: str | None = None) -> Any:
+    """Build the extraction service for ``backend`` (defaults to the configured one)."""
+    backend = backend or get_extraction_backend()
+    if backend == "gemini":
+        from app.gemini_extractor import GeminiExtractionService
+
+        return GeminiExtractionService(model=model)
+    if backend == "llm":
+        return LLMExtractionService(model=model)
+    raise LLMExtractionError(f"No LLM extraction service for backend '{backend}'")
 
 
 def _normalize_text(value: str) -> str:
