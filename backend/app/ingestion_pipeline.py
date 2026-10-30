@@ -29,10 +29,10 @@ from sqlalchemy.orm import Session, selectinload
 from app.db import SessionLocal, get_db, set_rls_user
 from app.auth import CurrentUserId, owner_scope
 from app.document_schemas import classify_document_type
-from app.model_inference import LayoutLMv3InferenceService
+from app.llm_extractor import LLMExtractionError, LLMExtractionService, build_llm_payloads, get_extraction_backend
 from app.models import Attribute, Document as DocumentRecord, Page
 from app.ocr_processor import extract_tokens_with_bboxes
-from app.routing_engine import build_attribute_payloads, build_ocr_baseline_payloads
+from app.routing_engine import build_ocr_baseline_payloads
 from app.table_reconstruction import reconstruct_tables
 from app.tasks import celery_app
 from app.storage import delete_file, download_file, storage_enabled, upload_file
@@ -1022,55 +1022,18 @@ def _build_attribute_payloads_for_page(
     if not tokens:
         return []
 
-    inference_service = LayoutLMv3InferenceService()
-    if inference_service.ocr_only:
-        return build_ocr_baseline_payloads(
-            page_id=page_id,
-            document_id=document_id,
-            tokens=tokens,
-            document_type=document_type,
-        )
+    if get_extraction_backend() == "llm":
+        try:
+            extraction = LLMExtractionService().extract_page(image_path, tokens, document_type)
+            return build_llm_payloads(extraction, tokens, page_id=page_id, document_id=document_id)
+        except LLMExtractionError as exc:
+            logger.warning("LLM extraction failed for %s; using OCR baseline: %s", image_path, exc)
 
-    token_predictions: List[dict[str, Any]] = []
-    try:
-        inference_result = inference_service.infer_page(
-            image_path=image_path,
-            tokens=[item["token"] for item in tokens],
-            normalized_bboxes=[item["bbox"] for item in tokens],
-            document_type=document_type,
-        )
-        token_predictions = inference_result.get("tokens", [])
-        for index, prediction in enumerate(token_predictions):
-            if index >= len(tokens):
-                break
-            prediction.update(
-                {
-                    "block_num": tokens[index].get("block_num", 0),
-                    "paragraph_num": tokens[index].get("paragraph_num", 0),
-                    "line_num": tokens[index].get("line_num", 0),
-                }
-            )
-    except Exception as exc:
-        logger.warning("LayoutLMv3 inference failed for %s; using OCR fallback: %s", image_path, exc)
-        token_predictions = [
-            {
-                "token": item["token"],
-                "label": "OCR",
-                "confidence": max(0.0, min(1.0, float(item["confidence"]) / 100.0)),
-                "bbox": item["bbox"],
-                "block_num": item.get("block_num", 0),
-                "paragraph_num": item.get("paragraph_num", 0),
-                "line_num": item.get("line_num", 0),
-            }
-            for item in tokens
-        ]
-
-    return build_attribute_payloads(
+    return build_ocr_baseline_payloads(
         page_id=page_id,
         document_id=document_id,
-        token_predictions=token_predictions,
+        tokens=tokens,
         document_type=document_type,
-        threshold=0.75,
     )
 
 

@@ -25,4 +25,4 @@ python -m app.dataset_tools cvat-to-jsonl \
 
 Run that command from `backend`, or set `PYTHONPATH=backend` when running it from the repository root. The converter runs the existing Tesseract OCR over each image and assigns a CVAT rectangle label to tokens whose rectangle overlap is at least 10%.
 
-For best results, annotate complete field spans and keep the image files unchanged between CVAT and conversion. Review `datasets/ground-truth/ground_truth.jsonl` before training, especially for words that cross rectangle boundaries.
+For best results, annotate complete field spans and keep the image files unchanged between CVAT and conversion. Review `datasets/ground-truth/ground_truth.jsonl` before using it for evaluation, especially for words that cross rectangle boundaries.

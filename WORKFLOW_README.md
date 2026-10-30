@@ -4,9 +4,9 @@ This guide explains exactly where files go and the order to follow when creating
 
 ## Important
 
-- The system uses LayoutLMv3 for token classification.
+- The system extracts fields with a multimodal LLM (Claude) from the page image plus OCR tokens.
 - CVAT is a separate annotation application. It is not part of this project's Docker Compose stack.
-- CVAT creates ground-truth annotations. It does not train the OCR model.
+- CVAT creates ground-truth annotations. It does not train anything; the annotations are used to measure accuracy.
 - Never use the model's predictions as ground truth.
 - Use the same generated page images for both CVAT and prediction.
 
@@ -23,13 +23,8 @@ D:\OCR\
       annotations.xml
     ground-truth/
       ground_truth.jsonl       Converted CVAT annotations
-      train.jsonl              Training split
-      validation.jsonl         Validation split
-      test.jsonl               Final holdout split
     predictions/
       predictions.jsonl        Model predictions
-    models/
-      layoutlmv3/              Trained model output
   uploads/                     Original uploaded PDFs; runtime storage
   samples/                     Sample files for development/tests
 ```
@@ -121,9 +116,9 @@ The result is:
 datasets/ground-truth/ground_truth.jsonl
 ```
 
-Review this file before training. Pay special attention to words that cross annotation-box boundaries.
+Review this file before relying on it. Pay special attention to words that cross annotation-box boundaries.
 
-### 5. Generate model predictions
+### 5. Generate LLM predictions (needs `ANTHROPIC_API_KEY`)
 
 You do not need to upload the PDF again. Use the saved page-image folder:
 
@@ -135,7 +130,7 @@ python -m app.dataset_tools predict `
   --output ..\datasets\predictions\predictions.jsonl
 ```
 
-The model guesses are saved here:
+The LLM's labels are saved here:
 
 ```text
 datasets/predictions/predictions.jsonl
@@ -160,53 +155,17 @@ The evaluation reports:
 - Per-label F1 score
 - Optional field exact-match rate
 
-Comparison measures the model. It does not train the model.
+Comparison measures the extractor. It does not change it.
 
-### 7. Prepare training, validation, and test data
+### 7. Improve the prompt or schemas
 
-Do not train and evaluate on the exact same documents. Separate the ground truth into three document groups:
+Extraction is prompt-driven, so there is no training step. If a label scores poorly:
 
-```text
-ground-truth/train.jsonl
- ground-truth/validation.jsonl
- ground-truth/test.jsonl
-```
+1. Look at the per-label results from step 6 and open a few failing pages.
+2. Adjust the field list or aliases in `backend/app/document_schemas.py`, or the instructions in `backend/app/llm_extractor.py`.
+3. Run steps 5 and 6 again and compare.
 
-Recommended split:
-
-- 70% training documents
-- 15% validation documents
-- 15% test documents
-
-The test documents must remain unseen until final evaluation.
-
-### 8. Train LayoutLMv3
-
-```powershell
-cd D:\OCR\backend
-
-python -m app.training train `
-  --train-file ..\datasets\ground-truth\train.jsonl `
-  --eval-file ..\datasets\ground-truth\validation.jsonl `
-  --output-dir ..\datasets\models\layoutlmv3 `
-  --seed 42
-```
-
-Training uses the verified ground-truth labels to update the model weights. It saves the trained model and processor in:
-
-```text
-datasets/models/layoutlmv3/
-```
-
-### 9. Use the trained model
-
-Set the model source in `.env` to the trained model directory:
-
-```text
-LAYOUTLMV3_MODEL_SOURCE=datasets/models/layoutlmv3
-```
-
-Restart the backend after changing `.env`. New predictions will then use the trained model instead of the base `microsoft/layoutlmv3-base` model.
+If you tune against these pages, keep a separate set of documents for a final check that you have not tuned against.
 
 ## Simple Process Summary
 
@@ -220,15 +179,11 @@ Same page PNGs
     -> ground-truth/ground_truth.jsonl
 
 Same page PNGs
-    -> LayoutLMv3 prediction
+    -> LLM prediction
     -> predictions/predictions.jsonl
 
 Ground truth + predictions
     -> evaluation metrics
-
-Ground truth training split
-    -> LayoutLMv3 fine-tuning
-    -> datasets/models/layoutlmv3/
 ```
 
 ## What Goes Where
@@ -239,11 +194,7 @@ Ground truth training split
 | Generated page images | `datasets/raw-pages/<document_id>/` |
 | CVAT export | `datasets/cvat/annotations.xml` |
 | Converted ground truth | `datasets/ground-truth/ground_truth.jsonl` |
-| Training data | `datasets/ground-truth/train.jsonl` |
-| Validation data | `datasets/ground-truth/validation.jsonl` |
-| Test data | `datasets/ground-truth/test.jsonl` |
 | Model guesses | `datasets/predictions/predictions.jsonl` |
-| Trained model | `datasets/models/layoutlmv3/` |
 
 ## Fresh Start Cleanup
 
@@ -254,7 +205,6 @@ Remove-Item -Recurse -Force datasets\raw-pages\*
 Remove-Item -Recurse -Force datasets\cvat\*
 Remove-Item -Recurse -Force datasets\ground-truth\source\*
 Remove-Item -Recurse -Force datasets\predictions\*
-Remove-Item -Recurse -Force datasets\models\*
 Remove-Item -Recurse -Force uploads\*
 Remove-Item -Force ocr_system.db, backend\ocr_system.db -ErrorAction SilentlyContinue
 ```

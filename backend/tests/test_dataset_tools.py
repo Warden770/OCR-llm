@@ -5,31 +5,13 @@ import json
 import pytest
 
 from app import dataset_tools
-from app.dataset_tools import convert_ground_truth, evaluate_predictions
+from app.dataset_tools import evaluate_predictions
+from app.llm_extractor import ExtractedField, PageExtraction
 
 
 def _write_json(path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
-
-
-def test_convert_ground_truth_writes_training_jsonl(tmp_path) -> None:
-    ground_truth = tmp_path / "ground_truth"
-    _write_json(
-        ground_truth / "invoice-001.json",
-        {
-            "document_id": "invoice-001",
-            "page_id": 1,
-            "tokens": ["Total", "42.00"],
-            "bboxes": [[10, 10, 100, 40], [110, 10, 180, 40]],
-            "labels": ["O", "TOTAL"],
-        },
-    )
-
-    output = tmp_path / "train.jsonl"
-    assert convert_ground_truth(ground_truth, output) == 1
-    record = json.loads(output.read_text(encoding="utf-8"))
-    assert record["labels"] == ["O", "TOTAL"]
 
 
 def test_evaluate_predictions_reports_label_and_bbox_metrics(tmp_path) -> None:
@@ -78,17 +60,17 @@ def test_generated_prediction_keys_match_page_based_ground_truth(tmp_path, monke
         lambda path: [{"token": "Total", "bbox": [10, 10, 100, 40]}],
     )
 
-    class FakeInference:
-        def __init__(self, model_source=None):
+    class FakeExtractor:
+        def __init__(self, model=None):
             pass
 
-        def infer_page(self, **kwargs):
-            return {
-                "document_type": "invoice",
-                "tokens": [{"token": "Total", "bbox": [10, 10, 100, 40], "label": "TOTAL", "confidence": 1.0}],
-            }
+        def extract_page(self, image_path, tokens, document_type=None):
+            return PageExtraction(
+                document_type="invoice",
+                fields=[ExtractedField(label="TOTAL", value="Total", token_indices=[0], confidence=1.0)],
+            )
 
-    monkeypatch.setattr(dataset_tools, "LayoutLMv3InferenceService", FakeInference)
+    monkeypatch.setattr(dataset_tools, "LLMExtractionService", FakeExtractor)
     predictions_path = tmp_path / "predictions.jsonl"
     assert dataset_tools.generate_predictions(raw_folder, predictions_path) == 1
 

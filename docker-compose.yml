@@ -33,6 +33,9 @@ services:
       RAW_DATASET_PAGES_DIR: /app/datasets/raw-pages
       TESSERACT_CMD: /usr/bin/tesseract
       OCR_RASTER_DPI: ${OCR_RASTER_DPI:-300}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      EXTRACTION_BACKEND: ${EXTRACTION_BACKEND:-}
+      LLM_EXTRACTION_MODEL: ${LLM_EXTRACTION_MODEL:-claude-sonnet-5-5}
     volumes:
       - ./uploads:/app/uploads
       - ./datasets:/app/datasets
@@ -64,6 +67,9 @@ services:
       RAW_DATASET_PAGES_DIR: /app/datasets/raw-pages
       TESSERACT_CMD: /usr/bin/tesseract
       OCR_RASTER_DPI: ${OCR_RASTER_DPI:-300}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      EXTRACTION_BACKEND: ${EXTRACTION_BACKEND:-}
+      LLM_EXTRACTION_MODEL: ${LLM_EXTRACTION_MODEL:-claude-sonnet-5-5}
     volumes:
       - ./uploads:/app/uploads
       - ./datasets:/app/datasets

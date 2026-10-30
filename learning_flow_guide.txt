@@ -1,54 +1,30 @@
-OCR DOCUMENT LEARNING FLOW
+OCR DOCUMENT FLOW (LLM-BASED)
 
-1. First run the 420 documents through the system to generate page images.
-   - This step creates the raw pages used for OCR and later model training.
-   - The system extracts per-page images from the uploaded documents.
+There is no model training. A multimodal LLM reads each page and extracts the fields defined for its
+document type. Ground truth is used only to measure accuracy.
 
-2. Use those page images to create the ground-truth dataset.
-   - OCR tokens and bounding boxes are generated.
-   - Human annotators label the correct fields and coordinates.
-   - The result is a JSONL file with records like:
-     - tokens
-     - bboxes
-     - labels
-     - document_id / page_id / image path
+1. Upload documents.
+   - Pages are rasterized to images and saved under datasets/raw-pages/<document_id>/.
 
-3. Build the training dataset from the ground-truth JSONL.
-   - This is the actual learning data for the model.
-   - The training script reads this labeled data and learns patterns.
+2. OCR and classification.
+   - Tesseract produces tokens and bounding boxes.
+   - The document type is classified, which selects the field list in document_schemas.py.
 
-4. Train the model.
-   - The code in backend/app/training.py reads the JSONL dataset.
-   - It splits data into train / validation / test sets.
-   - It trains LayoutLMv3 for token classification.
-   - It saves the trained model checkpoint and metadata.
+3. LLM extraction.
+   - backend/app/llm_extractor.py sends the page image and the numbered OCR tokens to Claude.
+   - Claude returns each field with the OCR token indices it came from and a confidence.
+   - Confidence >= 0.75 is pre-approved; the rest goes to human review.
+   - Without ANTHROPIC_API_KEY (or if the call fails) the system falls back to OCR-only heuristics.
 
-5. After training, run prediction on new documents or held-out validation/test data.
-   - This creates prediction JSONL files.
-   - These predictions are not the training input; they are the model output.
+4. Human review.
+   - Reviewers approve or correct fields in the dashboard. Corrections are kept for auditing.
 
-6. Compare predictions against ground truth.
-   - This tells us how accurate the model is.
-   - Metrics include token accuracy, bbox IoU, and per-label performance.
-
-7. Once the model is good enough, use it on new real uploads.
-   - New documents go through OCR + inference.
-   - The model predicts fields and coordinates.
-   - A human reviewer can approve or correct results.
-
-Important note:
-- The predictions folder stays empty until a prediction step is run.
-- The ground-truth JSONL is the learning source.
-- The predictions JSONL is the result of the trained model.
+5. Measure accuracy (optional, recommended).
+   - Annotate a sample of pages in CVAT to create independent ground truth.
+   - Run: dataset_tools predict, then dataset_tools evaluate.
+   - Adjust the prompt or schemas, then run both again and compare.
+   - Never use the model's own output as ground truth.
 
 Simple order:
-Raw documents -> page images -> annotated JSONL ground truth -> train model -> prediction on new data -> evaluate -> use live
-
-Typical sequence:
-- Step A: generate page images
-- Step B: annotate ground truth
-- Step C: train
-- Step D: validate/test predictions
-- Step E: deploy on new uploads
-
-This is the workflow the codebase is designed around.
+Raw documents -> page images -> OCR -> LLM extraction -> human review
+Evaluation loop: annotate sample -> predict -> evaluate -> tweak prompt/schemas -> repeat

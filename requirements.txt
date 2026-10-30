@@ -5,10 +5,7 @@ redis==4.6.0
 psycopg2-binary==2.9.9
 opencv-python-headless==4.10.0.84
 pytesseract==0.3.13
-torch==2.3.1
-transformers==4.43.0
-datasets==2.20.0
-accelerate==0.33.0
+anthropic>=0.40.0
 pdf2image==1.17.0
 PyMuPDF==1.24.9
 python-docx==1.1.2
@@ -17,11 +14,9 @@ sqlalchemy==2.0.30
 python-multipart==0.0.9
 pillow==10.4.0
 numpy==1.26.4
-scikit-learn==1.5.0
 python-dotenv==1.0.1
 alembic==1.13.2
 pytest==7.4.0
-seqeval==1.2.2
 PyJWT[crypto]==2.10.1
 httpx==0.28.1
 supabase==2.15.0

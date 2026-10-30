@@ -10,7 +10,7 @@ from xml.etree import ElementTree as ET
 
 from PIL import Image
 
-from app.model_inference import LayoutLMv3InferenceService
+from app.llm_extractor import LLMExtractionService, label_tokens
 from app.ocr_processor import extract_tokens_with_bboxes
 
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff"}
@@ -125,27 +125,18 @@ def _write_jsonl(records: Iterable[dict[str, Any]], output: str | Path) -> int:
     return count
 
 
-def convert_ground_truth(folder: str | Path, output: str | Path) -> int:
-    records = [_validate_token_record(record, str(folder)) for record in _load_json_records(folder)]
-    return _write_jsonl(records, output)
-
-
-def generate_predictions(raw_folder: str | Path, output: str | Path, model_source: str | None = None) -> int:
+def generate_predictions(raw_folder: str | Path, output: str | Path, model: str | None = None) -> int:
     root = Path(raw_folder)
     if not root.is_dir():
         raise FileNotFoundError(f"Raw image folder not found: {root}")
-    inference = LayoutLMv3InferenceService(model_source=model_source)
+    extractor = LLMExtractionService(model=model)
     records: list[dict[str, Any]] = []
     for image_path in sorted(path for path in root.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS):
         relative_id = image_path.relative_to(root).with_suffix("").as_posix()
         document_id, page_id = _dataset_identity(relative_id)
         tokens = extract_tokens_with_bboxes(image_path)
-        result = inference.infer_page(
-            image_path=image_path,
-            tokens=[item["token"] for item in tokens],
-            normalized_bboxes=[item["bbox"] for item in tokens],
-        )
-        prediction_tokens = result["tokens"]
+        extraction = extractor.extract_page(image_path, tokens)
+        prediction_tokens = label_tokens(extraction, tokens)
         records.append(
             {
                 "id": relative_id,
@@ -156,7 +147,7 @@ def generate_predictions(raw_folder: str | Path, output: str | Path, model_sourc
                 "bboxes": [item["bbox"] for item in prediction_tokens],
                 "labels": [item["label"] for item in prediction_tokens],
                 "confidences": [item["confidence"] for item in prediction_tokens],
-                "document_type": result.get("document_type"),
+                "document_type": extraction.document_type,
             }
         )
     if not records:
@@ -306,32 +297,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Ground-truth, prediction, evaluation, and CVAT dataset tools")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    convert_parser = subparsers.add_parser("convert", help="Convert ground-truth JSON files to training JSONL")
-    convert_parser.add_argument("--ground-truth", required=True)
-    convert_parser.add_argument("--output", required=True)
-
-    predict_parser = subparsers.add_parser("predict", help="Run OCR and LayoutLMv3 over a raw image folder")
+    predict_parser = subparsers.add_parser("predict", help="Run OCR and LLM extraction over a raw image folder")
     predict_parser.add_argument("--raw", required=True)
     predict_parser.add_argument("--output", required=True)
-    predict_parser.add_argument("--model-source")
+    predict_parser.add_argument("--model")
 
     evaluate_parser = subparsers.add_parser("evaluate", help="Compare predictions with independent ground truth")
     evaluate_parser.add_argument("--predictions", required=True)
     evaluate_parser.add_argument("--ground-truth", required=True)
     evaluate_parser.add_argument("--iou-threshold", type=float, default=0.5)
 
-    cvat_parser = subparsers.add_parser("cvat-to-jsonl", help="Convert CVAT image XML rectangles to LayoutLMv3 JSONL")
+    cvat_parser = subparsers.add_parser("cvat-to-jsonl", help="Convert CVAT image XML rectangles to token-level ground-truth JSONL")
     cvat_parser.add_argument("--xml", required=True)
     cvat_parser.add_argument("--image-root", required=True)
     cvat_parser.add_argument("--output", required=True)
 
     args = parser.parse_args(argv)
-    if args.command == "convert":
-        count = convert_ground_truth(args.ground_truth, args.output)
+    if args.command == "predict":
+        count = generate_predictions(args.raw, args.output, args.model)
         result: Any = {"records_written": count, "output": args.output}
-    elif args.command == "predict":
-        count = generate_predictions(args.raw, args.output, args.model_source)
-        result = {"records_written": count, "output": args.output}
     elif args.command == "evaluate":
         result = evaluate_predictions(args.predictions, args.ground_truth, args.iou_threshold)
     else:

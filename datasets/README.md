@@ -9,14 +9,10 @@ datasets/
   ground-truth/
     source/                  JSON files authored by hand, if used
     ground_truth.jsonl       converted CVAT annotations
-    train.jsonl              training split
-    validation.jsonl         validation split
-    test.jsonl               final holdout split
-  predictions/               model output, predictions.jsonl
-  models/                    trained LayoutLMv3 model output
+  predictions/               LLM output, predictions.jsonl
 ```
 
-Do not put PDFs, CVAT exports, or model predictions in `uploads/`. Uploaded PDFs remain there; processed page images belong in `raw-pages/`.
+Do not put PDFs, CVAT exports, or predictions in `uploads/`. Uploaded PDFs remain there; processed page images belong in `raw-pages/`.
 
 Recommended flow:
 
@@ -26,6 +22,6 @@ Recommended flow:
 4. Convert it to `ground-truth/ground_truth.jsonl`.
 5. Generate predictions into `predictions/predictions.jsonl`.
 6. Evaluate predictions against `ground-truth/ground_truth.jsonl`.
-7. Split ground truth into train, validation, and test files before training.
+7. Adjust the prompt or schemas if needed and repeat steps 5-6.
 
 Ground truth is independent human annotation. Never replace it with model predictions.
