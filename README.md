@@ -8,7 +8,7 @@ An AI-based pipeline that ingests non-standard documents, rasterizes them into p
 2. **Read with Claude** (`backend/app/claude_extractor.py`). Up to `CLAUDE_PAGES_PER_REQUEST` pages are sent per request as images. Claude returns the document type, a transcription of every page, the attributes it found (name, value, confidence, page) and any tables, as structured JSON (`output_config.format`). Attribute names come from the document itself.
 3. **Validate**: empty values, empty labels and out-of-range pages are dropped; duplicates keep the higher confidence.
 4. **Route**: confidence of 0.75 or more is pre-approved; everything else goes to human review. A value that does not appear in its own page's transcription is capped at 0.5. This is a consistency check inside a single model response, not an independent verification.
-5. **Review** in the dashboard: edit, approve and save attributes to the database, then search and export them. Corrections are stored for auditing.
+5. **Review** in the dashboard: edit, approve and save attributes to the database, then search and export them. Detected tables appear in the Tables tab, where cells, rows, columns and merges can be edited; a saved table can be edited later and saved again with "Save table changes". Corrections are stored for auditing.
 
 If Claude cannot be reached or returns something unusable (missing or invalid key, rate limit, overload, timeout, refusal, malformed response), the document is marked `FAILED` with a short readable reason, and Retry runs it again. There is no OCR fallback: Tesseract and OpenCV were removed. A request that is cut off by the output limit, or refused, is split in half and retried so that only the offending page fails.
 

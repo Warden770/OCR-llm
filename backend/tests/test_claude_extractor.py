@@ -179,6 +179,19 @@ def test_prompt_asks_for_the_body_of_letters_not_only_labelled_fields(pages) -> 
         assert expected in prompt
 
 
+def test_prompt_and_task_ask_for_every_table_in_the_tables_list(pages) -> None:
+    transport = FakeTransport(_response(_payload(attributes=[])))
+    service, _ = _service(transport)
+
+    service.extract_document(pages(1))
+
+    call = transport.calls[0]
+    prompt = call["payload"]["system"]
+    for expected in ("return it in the tables list and not as attributes", "header row first", "exactly one string per column", "continues on the next page"):
+        assert expected in prompt
+    assert "every table on these pages in the tables list" in _content(call)[-1]["text"]
+
+
 def test_default_model_comes_from_environment_then_constant(monkeypatch) -> None:
     monkeypatch.delenv("CLAUDE_EXTRACTION_MODEL", raising=False)
     assert ClaudeExtractionService(api_key="k").model == DEFAULT_CLAUDE_MODEL

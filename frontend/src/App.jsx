@@ -1663,6 +1663,8 @@ function ReconstructedTableCard({
   onRemoveColumn,
   onMergeCells,
   onSplitCell,
+  onSaveChanges,
+  saveStatus,
 }) {
   const rows = table.rows || []
   const tableConfidenceTone = confidenceBorderTone(Number(table.confidence_score || 0))
@@ -1706,6 +1708,16 @@ function ReconstructedTableCard({
         />
         <div className="flex flex-wrap gap-1.5">
           <button type="button" onClick={() => onCompare(table)} className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100">Compare on page</button>
+          {onSaveChanges ? (
+            <button
+              type="button"
+              onClick={() => onSaveChanges(table)}
+              disabled={saveStatus === 'saving'}
+              className="rounded-lg border border-emerald-600 bg-emerald-600 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-60"
+            >
+              {saveStatus === 'saving' ? 'Saving...' : saveStatus === 'saved' ? 'Saved' : 'Save table changes'}
+            </button>
+          ) : null}
           <button type="button" onClick={() => onAddRow(table.id)} className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100">Add row</button>
           <button type="button" onClick={() => onRemoveRow(table.id)} disabled={rows.length <= 1} className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 disabled:opacity-40">Remove last row</button>
           <button type="button" onClick={() => onAddColumn(table.id)} className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100">Add column</button>
@@ -1757,7 +1769,7 @@ function ReconstructedTableCard({
                             <textarea
                               aria-label={`Cell ${rowIndex + 1}, ${Number(cell.column_index || 0) + 1}`}
                               value={cell.text || ''}
-                              rows={Math.min(5, Math.max(1, String(cell.text || '').split('\n').length))}
+                              rows={Math.min(14, Math.max(1, String(cell.text || '').split('\n').length))}
                               onClick={(event) => event.stopPropagation()}
                               onChange={(event) => onEditCell(table.id, cell.id, event.target.value)}
                               className={`w-full min-w-[52px] resize-y overflow-hidden rounded-sm bg-transparent p-0.5 text-xs leading-4 outline-none focus:bg-white focus:ring-1 focus:ring-cyan-600 ${cell.bold || cell.is_header ? 'font-semibold' : 'font-normal'}`}
@@ -1826,6 +1838,54 @@ function ViewerPage({
   const [selectedTextFieldKeys, setSelectedTextFieldKeys] = useState(() => new Set())
   const initialTables = useMemo(() => collectDocumentTables(ocrPages, attributes), [attributes, ocrPages])
   const [detectedTables, setDetectedTables] = useState(initialTables)
+  const [tableSaveStatus, setTableSaveStatus] = useState({})
+
+  // Tables that were already saved as attributes can be edited here and saved back in place.
+  const savedTableAttributes = useMemo(() => {
+    const byTableId = new Map()
+    for (const attribute of attributes || []) {
+      if (attribute.id && attribute.table_data?.id) {
+        byTableId.set(attribute.table_data.id, attribute)
+      }
+    }
+    return byTableId
+  }, [attributes])
+
+  const saveTableChanges = async (table) => {
+    const attribute = savedTableAttributes.get(table.id)
+    if (!attribute) {
+      return
+    }
+    setReviewError('')
+    setTableSaveStatus((current) => ({ ...current, [table.id]: 'saving' }))
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/v1/attributes/correct`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          document_id: attribute.document_id ?? documentData?.id,
+          corrections: [
+            {
+              attribute_id: attribute.id,
+              original_prediction: attribute.extracted_value,
+              corrected_value: JSON.stringify({ kind: 'table', version: 1, table: { ...table, kind: 'table', version: 1 } }),
+              corrected_label: table.title || attribute.entity_type_label,
+              validation_status: attribute.validation_status,
+            },
+          ],
+        }),
+      })
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}))
+        throw new Error(result.detail || 'Failed to save table changes.')
+      }
+      setTableSaveStatus((current) => ({ ...current, [table.id]: 'saved' }))
+      await onRefreshDocument?.()
+    } catch (error) {
+      setTableSaveStatus((current) => ({ ...current, [table.id]: undefined }))
+      setReviewError(error.message || 'Failed to save table changes.')
+    }
+  }
 
   useEffect(() => {
     setDetectedTables(initialTables)
@@ -2529,6 +2589,8 @@ function ViewerPage({
                     table={table}
                     selected={selectedTableKeys.has(table.id)}
                     selectedCellKeys={selectedCellKeys}
+                    onSaveChanges={!isDraftReview && savedTableAttributes.has(table.id) ? saveTableChanges : undefined}
+                    saveStatus={tableSaveStatus[table.id]}
                     onToggleTable={toggleTableSelection}
                     onToggleCell={toggleCellSelection}
                     onEditCell={editTableCell}
