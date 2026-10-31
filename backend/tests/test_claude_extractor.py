@@ -168,6 +168,17 @@ def test_request_shape_key_only_in_header_structured_output_and_no_attribute_enu
     assert "region" not in payload["system"] and "pixels" not in payload["system"]
 
 
+def test_prompt_asks_for_the_body_of_letters_not_only_labelled_fields(pages) -> None:
+    transport = FakeTransport(_response(_payload(attributes=[])))
+    service, _ = _service(transport)
+
+    service.extract_document(pages(1))
+
+    prompt = transport.calls[0]["payload"]["system"]
+    for expected in ("letters, memos", "main body", "one item per line", "never summarized or paraphrased"):
+        assert expected in prompt
+
+
 def test_default_model_comes_from_environment_then_constant(monkeypatch) -> None:
     monkeypatch.delenv("CLAUDE_EXTRACTION_MODEL", raising=False)
     assert ClaudeExtractionService(api_key="k").model == DEFAULT_CLAUDE_MODEL
