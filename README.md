@@ -1,24 +1,28 @@
 # OCR Attribute Extraction System
 
-An AI-based pipeline that ingests non-standard documents, rasterizes them at 300 DPI, classifies the document type, reads the text with Tesseract, and extracts the fields defined for that document type with a multimodal LLM (Claude or Gemini). Every extracted value is tied back to the OCR tokens it came from, and low-confidence fields are routed to human review.
+An AI-based pipeline that ingests non-standard documents, rasterizes them into page images, and lets Claude do everything else: read the text (OCR, including tables and layout), decide what kind of document it is, decide which attributes the document actually contains, and return each attribute with a confidence score and a page number. There are no predefined field lists or templates. Low-confidence values are routed to human review.
 
 ## How extraction works
 
-1. **Ingest and rasterize** PDF, DOCX, DOC and image uploads into page images.
-2. **OCR** each page with Tesseract to get tokens with bounding boxes.
-3. **Classify** the document type (keyword scoring) to select the attribute schema in `backend/app/document_schemas.py`.
-4. **Extract** with the LLM (`backend/app/llm_extractor.py`). The model receives the page image and the numbered OCR tokens, and returns the schema fields through a forced tool call. Each field cites the token indices it came from, so bounding boxes are exact and the review UI can highlight the source.
-5. **Route**: confidence of 0.75 or more is pre-approved; everything else goes to human review. Values that cite no OCR tokens are capped at 0.5, and values that differ from the cited OCR text (the model corrected an OCR error) are scaled down, so both are reviewed by a person.
-6. **Review** in the dashboard. Corrections are stored for auditing and for building an evaluation set.
+1. **Ingest and rasterize** PDF, DOCX, DOC and image uploads into page images. Claude reads images (JPEG, PNG, GIF, WebP), and the review screen needs the same page images that regions refer to, so the page images are what Claude reads.
+2. **Read with Claude** (`backend/app/claude_extractor.py`). Up to `CLAUDE_PAGES_PER_REQUEST` pages are sent per request as images. Claude returns the document type, a transcription of every page, the attributes it found (name, value, confidence, page) and any tables, as structured JSON (`output_config.format`). Attribute names come from the document itself.
+3. **Validate**: empty values, empty labels and out-of-range pages are dropped; duplicates keep the higher confidence.
+4. **Route**: confidence of 0.75 or more is pre-approved; everything else goes to human review. A value that does not appear in its own page's transcription is capped at 0.5. This is a consistency check inside a single model response, not an independent verification.
+5. **Review** in the dashboard: edit, approve and save attributes to the database, then search and export them. Corrections are stored for auditing.
 
-There is no model training. Behaviour is changed by editing the prompt in `llm_extractor.py` or the field lists in `document_schemas.py`. If `ANTHROPIC_API_KEY` is not set, or an LLM call fails, the page falls back to the OCR-only heuristics in `routing_engine.py`, so uploads never block on the API.
+If Claude cannot be reached or returns something unusable (missing or invalid key, rate limit, overload, timeout, refusal, malformed response), the document is marked `FAILED` with a short readable reason, and Retry runs it again. There is no OCR fallback: Tesseract and OpenCV were removed. A request that is cut off by the output limit, or refused, is split in half and retried so that only the offending page fails.
+
+### What is different from word-level OCR
+
+- Claude's confidence is its own rating, not a measured accuracy like per-word OCR confidence. Treat it as a review signal.
+- **Regions are off by default.** Anthropic documents Claude's pixel coordinates as approximate, and a wrong box is worse than none, so the page viewer shows no highlighted regions unless you set `CLAUDE_REQUEST_BOXES=true`. Attributes stay selectable from the side panel either way. Word-level highlighting and per-word confidence no longer exist.
+- Attribute names can vary a little between documents of the same type, because nothing fixes them.
+- Tables come back as text rows. Without regions, table cells have no boxes, and every cell is marked uncertain.
 
 ## Stack
 
 - Python 3.10
-- Anthropic API (Claude) or Gemini API, both multimodal, for extraction
-- Tesseract OCR v5
-- OpenCV
+- Claude API (Messages API, vision and structured outputs) for OCR, document typing and attribute extraction, called with `httpx`
 - PyMuPDF (fitz)
 - python-docx + LibreOffice for `.doc` conversion, with a direct PNG fallback for `.docx`
 - Pillow (PIL)
@@ -30,7 +34,7 @@ There is no model training. Behaviour is changed by editing the prompt in `llm_e
 
 ## Project Layout
 
-- `backend/app/` FastAPI app, ingestion pipeline, OCR processor, inference, models, and routing
+- `backend/app/` FastAPI app, ingestion pipeline, Claude extractor, and models
 - `backend/alembic/` database migration environment
 - `frontend/` HITL dashboard UI
 - `datasets/raw-pages/` rasterized page storage for the application, CVAT, and evaluation
@@ -53,14 +57,19 @@ If port 8000 is already occupied, the preflight check exits with a clear message
 
 | Variable | Purpose |
 |---|---|
-| `ANTHROPIC_API_KEY` | Enables LLM extraction. Keep it server-side (backend and worker only). |
-| `GEMINI_API_KEY` | Enables the Gemini backend. A free key from Google AI Studio works; a Google AI Pro/Plus subscription does not include API access. |
-| `GEMINI_EXTRACTION_MODEL`, `GEMINI_TIMEOUT_SECONDS` | Gemini model (default `gemini-2.5-flash`) and request timeout (60). |
-| `EXTRACTION_BACKEND` | `llm` (Claude), `gemini` or `ocr`. Blank means Claude if `ANTHROPIC_API_KEY` is set, else Gemini if `GEMINI_API_KEY` is set, else `ocr`. |
-| `LLM_EXTRACTION_MODEL` | Model ID, default `claude-sonnet-5-5`. |
-| `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES` | Request timeout (120) and retry count (3). |
+| `ANTHROPIC_API_KEY` | Required. Keep it server-side (backend and worker only). If it is missing, documents fail with "ANTHROPIC_API_KEY is not set". |
+| `CLAUDE_EXTRACTION_MODEL` | Claude model, default `claude-sonnet-5-5`. Recent models reject forced tool use, which is why the reply is requested as structured JSON. |
+| `CLAUDE_PAGES_PER_REQUEST` | Pages sent per request, default `6`. |
+| `CLAUDE_IMAGE_MAX_EDGE` | Longest edge in pixels of the JPEG sent for each page, default `2048`. Each page costs up to about 4,800 input tokens for the image, plus the transcription as output. |
+| `CLAUDE_TIMEOUT_SECONDS` | Per-request timeout, default `120` (`.env.example` sets `180`). |
+| `CLAUDE_REQUEST_DELAY_SECONDS` | Pause between requests for one document, default `0`. Raise it to stay under your rate limits. |
+| `CLAUDE_REQUEST_BOXES` | `true` asks Claude for an approximate region per attribute so the viewer can outline it. Default `false`. |
+| `CLAUDE_MAX_OUTPUT_TOKENS`, `CLAUDE_MAX_REQUEST_BYTES` | Optional. Output limit per request (default `16000`) and the image budget per request (default about 25 MB). |
+| `SOFFICE_CMD`, `OCR_RASTER_DPI` | LibreOffice command for `.doc` conversion, and the DPI used when rasterizing PDFs (default `300`). |
 
-Privacy note: with an LLM backend, page images and OCR text are sent to Anthropic or Google. Gemini free-tier requests may be used by Google to improve its products, so do not use the free tier for confidential documents. Use `EXTRACTION_BACKEND=ocr` for documents that must not leave your environment.
+Rate limits (HTTP 429) and server errors (5xx, including 529 overloaded) are retried up to three times with exponential backoff, honouring `Retry-After`. Error messages carry the HTTP status or reason and Anthropic's `request-id` for support; request payloads, response bodies and the API key are never logged or raised.
+
+**Privacy:** page images are sent to Anthropic for every document. Check the data retention and usage terms that apply to your Anthropic account before using confidential documents. This system has no offline mode.
 
 ## Run The System
 
@@ -78,17 +87,6 @@ Celery runs in asynchronous mode by default. Set `CELERY_TASK_ALWAYS_EAGER=true`
 
 DOCX files are currently rasterized with a direct text-to-PNG fallback in the ingestion pipeline. LibreOffice/PDF conversion is used for `.doc` inputs.
 
-## Measuring accuracy
+## Checking quality
 
-Because nothing is trained, ground truth is used only to measure how well the prompt and schemas work. Build it from independent human annotation, never from the model's own output:
-
-```bash
-# From the backend directory
-python -m app.dataset_tools cvat-to-jsonl --xml ../datasets/cvat/annotations.xml --image-root ../datasets/raw-pages --output ../datasets/ground-truth/ground_truth.jsonl
-python -m app.dataset_tools predict --raw ../datasets/raw-pages --output ../datasets/predictions/predictions.jsonl
-python -m app.dataset_tools evaluate --predictions ../datasets/predictions/predictions.jsonl --ground-truth ../datasets/ground-truth/ground_truth.jsonl
-```
-
-`predict` runs OCR and the LLM extractor over page images and writes token-level labels. `evaluate` reports token accuracy, bounding-box IoU match rate, per-label precision/recall/F1, and optional field exact-match rate. Re-run it after any prompt or schema change to see whether accuracy moved. If you tune the prompt on some documents, keep a separate set for the final check.
-
-CVAT rectangle exports are converted into the ground-truth format. See [cvat/README.md](cvat/README.md) for the self-hosted CVAT workflow. CVAT is an annotation tool here, not part of the extraction path. Approved and corrected attributes can also be exported with `python -m app.exporter output/export.jsonl` for use as additional evaluation data.
+There is no training and no fixed field list, so quality is checked by reading results. Upload a few representative documents, open them in the review screen, and compare the attributes with the page. Watch for the same concept getting different names across documents of one type, and for values that need correcting; both are visible in the stored corrections. The previous token-level evaluation tooling (CVAT conversion, `predict`, `evaluate`) and the training-data exporter were removed with word-level OCR.
