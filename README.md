@@ -63,11 +63,12 @@ If port 8000 is already occupied, the preflight check exits with a clear message
 | `CLAUDE_IMAGE_MAX_EDGE` | Longest edge in pixels of the JPEG sent for each page, default `2048`. Each page costs up to about 4,800 input tokens for the image, plus the transcription as output. |
 | `CLAUDE_TIMEOUT_SECONDS` | Per-request timeout, default `120` (`.env.example` sets `180`). |
 | `CLAUDE_REQUEST_DELAY_SECONDS` | Pause between requests for one document, default `0`. Raise it to stay under your rate limits. |
+| `CLAUDE_MAX_RETRIES` | How many times a rate limit (429) or server error (5xx) is retried before the request fails, default `5`. |
 | `CLAUDE_REQUEST_BOXES` | `true` asks Claude for an approximate region per attribute so the viewer can outline it. Default `false`. |
 | `CLAUDE_MAX_OUTPUT_TOKENS`, `CLAUDE_MAX_REQUEST_BYTES` | Optional. Output limit per request (default `16000`) and the image budget per request (default about 25 MB). |
 | `SOFFICE_CMD`, `OCR_RASTER_DPI` | LibreOffice command for `.doc` conversion, and the DPI used when rasterizing PDFs (default `300`). |
 
-Rate limits (HTTP 429) and server errors (5xx, including 529 overloaded) are retried up to three times with exponential backoff, honouring `Retry-After`. Error messages carry the HTTP status or reason and Anthropic's `request-id` for support; request payloads, response bodies and the API key are never logged or raised.
+Rate limits (HTTP 429) and server errors (5xx, including 529 overloaded) are retried up to five times, waiting 2, 4, 8, 16 and 30 seconds (or the `Retry-After` the API sends). If a multi-page request still fails with a server error, it is split in half and each half retried, because shorter answers fail less often when the service is struggling; a single page that still fails makes the document `FAILED` with the status in the message, and Retry runs it again. Error messages carry the HTTP status or reason and Anthropic's `request-id` for support; request payloads, response bodies and the API key are never logged or raised.
 
 **Privacy:** page images are sent to Anthropic for every document. Check the data retention and usage terms that apply to your Anthropic account before using confidential documents. This system has no offline mode.
 

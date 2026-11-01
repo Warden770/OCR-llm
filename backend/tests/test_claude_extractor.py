@@ -14,6 +14,7 @@ from app.claude_extractor import (
     CLAUDE_ENDPOINT,
     DEFAULT_CLAUDE_MODEL,
     ClaudeExtractionError,
+    ClaudeServiceError,
     ClaudeExtractionService,
     DocumentExtraction,
     ExtractedAttribute,
@@ -492,19 +493,72 @@ def test_retry_after_is_capped_and_backoff_is_exponential_including_overloaded(p
 
     service.extract_document(pages(1))
 
-    assert sleeps == [60.0, 2.0, 4.0]
+    assert sleeps == [60.0, 4.0, 8.0]
 
 
-def test_server_errors_give_up_after_three_retries(pages) -> None:
+def test_server_errors_give_up_after_five_retries(pages) -> None:
     transport = FakeTransport(_response(status=529, body={"error": RESPONSE_BODY_MARKER}))
     service, sleeps = _service(transport)
 
     with pytest.raises(ClaudeExtractionError, match=r"HTTP 529 \(Claude is overloaded\)") as excinfo:
         service.extract_document(pages(1))
 
-    assert len(transport.calls) == 4  # first attempt + 3 retries
-    assert sleeps == [1.0, 2.0, 4.0]
+    assert len(transport.calls) == 6  # first attempt + 5 retries
+    assert sleeps == [2.0, 4.0, 8.0, 16.0, 30.0]
     assert RESPONSE_BODY_MARKER not in str(excinfo.value)
+
+
+def test_the_number_of_retries_is_configurable(pages, monkeypatch) -> None:
+    monkeypatch.setenv("CLAUDE_MAX_RETRIES", "1")
+    transport = FakeTransport(_response(status=503))
+    service, sleeps = _service(transport)
+    with pytest.raises(ClaudeExtractionError, match="HTTP 503"):
+        service.extract_document(pages(1))
+    assert len(transport.calls) == 2 and sleeps == [2.0]
+
+    monkeypatch.setenv("CLAUDE_MAX_RETRIES", "0")
+    transport = FakeTransport(_response(status=503))
+    service, sleeps = _service(transport)
+    with pytest.raises(ClaudeExtractionError):
+        service.extract_document(pages(1))
+    assert len(transport.calls) == 1 and sleeps == []
+
+
+def test_a_persistent_server_error_on_a_multi_page_request_splits_it(pages) -> None:
+    ok_first = _response(_payload("Syllabus", [{"page": 1, "text": "a"}, {"page": 2, "text": "b"}], [_attribute("A", "1", page=1)]))
+    ok_second = _response(_payload("Syllabus", [{"page": 3, "text": "c"}, {"page": 4, "text": "d"}], [_attribute("B", "2", page=4)]))
+    transport = FakeTransport(*([_response(status=529)] * 6), ok_first, ok_second)
+    service, sleeps = _service(transport)
+
+    result = service.extract_document(pages(4))
+
+    assert [_page_labels(call) for call in transport.calls] == (
+        [["Page 1", "Page 2", "Page 3", "Page 4"]] * 6 + [["Page 1", "Page 2"], ["Page 3", "Page 4"]]
+    )
+    assert sleeps == [2.0, 4.0, 8.0, 16.0, 30.0]
+    assert [a.label for a in result.attributes] == ["A", "B"]
+    assert sorted(result.page_text) == [1, 2, 3, 4]
+
+
+def test_splitting_stops_at_a_single_page_and_the_error_names_the_status(pages) -> None:
+    transport = FakeTransport(_response(status=503))
+    service, _ = _service(transport)
+
+    with pytest.raises(ClaudeServiceError, match="HTTP 503"):
+        service.extract_document(pages(2))
+
+    assert [_page_labels(call) for call in transport.calls] == [["Page 1", "Page 2"]] * 6 + [["Page 1"]] * 6
+
+
+def test_a_rate_limit_is_not_split_because_smaller_requests_do_not_help(pages) -> None:
+    transport = FakeTransport(_response(status=429))
+    service, _ = _service(transport)
+
+    with pytest.raises(ClaudeExtractionError, match="HTTP 429") as excinfo:
+        service.extract_document(pages(2))
+
+    assert not isinstance(excinfo.value, ClaudeServiceError)
+    assert [_page_labels(call) for call in transport.calls] == [["Page 1", "Page 2"]] * 6
 
 
 def test_rate_limit_that_never_clears_reports_it(pages) -> None:

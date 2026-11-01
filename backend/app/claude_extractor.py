@@ -48,7 +48,7 @@ DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_OUTPUT_TOKENS = 16000
 # The API accepts far more (128 MB), but keep each request modest so a failure wastes little work.
 DEFAULT_MAX_REQUEST_BYTES = 25_000_000
-MAX_RETRIES = 3
+DEFAULT_MAX_RETRIES = 5
 MAX_RETRY_AFTER_SECONDS = 60.0
 
 # Image limits from the Claude vision docs: one visual token per 28x28 px patch, and models from
@@ -119,6 +119,10 @@ def system_prompt(request_boxes: bool = False) -> str:
 
 class ClaudeExtractionError(RuntimeError):
     """Raised when the Claude call or its response cannot be used."""
+
+
+class ClaudeServiceError(ClaudeExtractionError):
+    """The API kept answering with a 5xx error (overload, outage, gateway timeout) after every retry."""
 
 
 class ExtractionCanceled(Exception):
@@ -630,6 +634,7 @@ class ClaudeExtractionService:
             if request_boxes is not None
             else os.getenv("CLAUDE_REQUEST_BOXES", "").strip().lower() in _TRUE_VALUES
         )
+        self.max_retries = _env_int("CLAUDE_MAX_RETRIES", DEFAULT_MAX_RETRIES, minimum=0)
         self.max_output_tokens = _env_int("CLAUDE_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS, minimum=1024)
         self.max_request_bytes = _env_int("CLAUDE_MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES, minimum=1_000_000)
 
@@ -712,6 +717,12 @@ class ClaudeExtractionService:
                     f"Claude ran out of output tokens on page {chunk[0].number}; raise CLAUDE_MAX_OUTPUT_TOKENS"
                 ) from None
             logger.info("Claude response was truncated; splitting %d pages into two requests", len(chunk))
+        except ClaudeServiceError:
+            if len(chunk) == 1:
+                raise
+            # Smaller requests mean shorter answers, which fail less often when the service is struggling.
+            logger.info("Claude kept returning a server error; splitting %d pages into two requests", len(chunk))
+            return self._split_and_extract(chunk, api_key, known_document_type, should_cancel)
         except _RefusalStop:
             if len(chunk) == 1:
                 raise ClaudeExtractionError(
@@ -803,18 +814,21 @@ class ClaudeExtractionService:
             status = getattr(response, "status_code", 200)
             # 429 rate limit, 5xx errors including 529 "overloaded"
             retryable = status == 429 or (isinstance(status, int) and status >= 500)
-            if retryable and retries < MAX_RETRIES:
+            if retryable and retries < self.max_retries:
                 delay = _retry_after_seconds(response)
                 self._sleep(delay if delay is not None else self._backoff(retries))
                 retries += 1
                 continue
             if status != 200:
-                raise _status_error(status, response)
+                error = _status_error(status, response)
+                if isinstance(status, int) and status >= 500:
+                    raise ClaudeServiceError(str(error)) from None
+                raise error
             return response
 
     @staticmethod
     def _backoff(attempt: int) -> float:
-        return float(min(2 ** attempt, 30))
+        return float(min(2 ** (attempt + 1), 30))
 
     @staticmethod
     def _read_response(response: Any, sizes: Optional[Dict[int, tuple[int, int]]] = None) -> DocumentExtraction:
