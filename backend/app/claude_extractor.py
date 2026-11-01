@@ -133,6 +133,10 @@ class _TruncatedResponse(Exception):
     """Internal: Claude stopped because it ran out of output tokens (or context)."""
 
 
+class _InvalidResponse(Exception):
+    """Internal: the reply could not be parsed as JSON (usually a very long answer that was cut off or garbled)."""
+
+
 class _RefusalStop(Exception):
     """Internal: Claude declined to answer (stop_reason "refusal", which arrives as HTTP 200)."""
 
@@ -534,6 +538,25 @@ def _parse_payload(data: Any, sizes: Optional[Dict[int, tuple[int, int]]] = None
 
 
 
+def _loads_lenient(text: str) -> Any:
+    """Parse the model's JSON, tolerating a markdown fence or stray text around the object.
+
+    Raises ``ValueError`` (with a position, never the text itself) when no JSON object can be read.
+    """
+    stripped = text.strip()
+    try:
+        return json.loads(stripped)
+    except ValueError as first_error:
+        start = stripped.find("{")
+        if start >= 0:
+            try:
+                value, _ = json.JSONDecoder().raw_decode(stripped[start:])
+                return value
+            except ValueError:
+                pass
+        raise first_error
+
+
 def _retry_after_seconds(response: Any) -> Optional[float]:
     headers = getattr(response, "headers", None)
     if not headers:
@@ -730,6 +753,13 @@ class ClaudeExtractionService:
                 ) from None
             # Narrow down which page is refused; the other pages are still read normally.
             logger.info("Claude refused a request; splitting %d pages into two requests", len(chunk))
+        except _InvalidResponse:
+            if len(chunk) == 1:
+                raise ClaudeExtractionError(
+                    f"Claude response was not valid JSON (page {chunk[0].number})"
+                ) from None
+            # A shorter request means a shorter answer, which is less likely to come back garbled.
+            logger.info("Claude returned an unreadable answer; splitting %d pages into two requests", len(chunk))
         return self._split_and_extract(chunk, api_key, known_document_type, should_cancel)
 
     def _split_and_extract(
@@ -835,9 +865,11 @@ class ClaudeExtractionService:
         try:
             body = response.json()
         except Exception:
-            raise ClaudeExtractionError("Claude response was not valid JSON") from None
+            logger.warning("Claude returned an HTTP body that is not JSON")
+            raise _InvalidResponse() from None
         if not isinstance(body, dict):
-            raise ClaudeExtractionError("Claude response was not valid JSON")
+            logger.warning("Claude returned an HTTP body that is not a JSON object")
+            raise _InvalidResponse()
 
         # A refusal is a normal HTTP 200 with stop_reason "refusal"; check before looking at the content.
         stop_reason = body.get("stop_reason")
@@ -859,9 +891,13 @@ class ClaudeExtractionService:
         if not text.strip():
             raise ClaudeExtractionError("Claude returned no content")
         try:
-            data = json.loads(text)
-        except ValueError:
-            raise ClaudeExtractionError("Claude response was not valid JSON") from None
+            data = _loads_lenient(text)
+        except ValueError as exc:
+            # Only the parser's message (a position) is logged, never the model's text.
+            logger.warning(
+                "Claude returned %d characters that are not valid JSON (stop reason %s): %s", len(text), stop_reason, exc
+            )
+            raise _InvalidResponse() from None
         return _parse_payload(data, sizes)
 
 
