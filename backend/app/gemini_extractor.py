@@ -46,6 +46,10 @@ DEFAULT_MAX_OUTPUT_TOKENS = 32768
 DEFAULT_MAX_REQUEST_BYTES = 18_000_000
 DEFAULT_MAX_RETRIES = 5
 MAX_RETRY_AFTER_SECONDS = 60.0
+# A per-minute limit can ask for a longer wait than a header normally does; never wait longer than this once.
+MAX_RATE_LIMIT_WAIT_SECONDS = 120.0
+# After the first 429 in a document, leave this long between requests so the rest do not hit the limit again.
+RATE_LIMIT_SPACING_SECONDS = 10.0
 
 SYSTEM_PROMPT = (
     "You read scanned or photographed document pages and return structured data. "
@@ -552,6 +556,39 @@ def _retry_after_seconds(response: Any) -> Optional[float]:
     return min(seconds, MAX_RETRY_AFTER_SECONDS)
 
 
+def _rate_limit_info(response: Any) -> tuple[bool, Optional[float]]:
+    """Read a 429 body: (is a daily quota used up?, the wait the API suggests, in seconds).
+
+    Google's error body can carry ``QuotaFailure`` (whose ``quotaId`` says which limit was hit; ids with
+    "PerDay"/"Daily" reset once a day, so retrying within minutes cannot help) and ``RetryInfo.retryDelay``.
+    Only these two derived facts leave this function; the body itself is never logged or raised.
+    """
+    try:
+        body = response.json()
+    except Exception:
+        return False, None
+    error = body.get("error") if isinstance(body, dict) else None
+    details = error.get("details") if isinstance(error, dict) else None
+    if not isinstance(details, list):
+        return False, None
+    daily = False
+    delay: Optional[float] = None
+    for item in details:
+        if not isinstance(item, dict):
+            continue
+        violations = item.get("violations")
+        for violation in violations if isinstance(violations, list) else []:
+            quota_id = violation.get("quotaId") if isinstance(violation, dict) else None
+            if isinstance(quota_id, str) and re.search(r"per[-_ ]?day|daily", quota_id, re.IGNORECASE):
+                daily = True
+        raw_delay = item.get("retryDelay")
+        if isinstance(raw_delay, str):
+            match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)s\s*", raw_delay)
+            if match:
+                delay = float(match.group(1))
+    return daily, (min(delay, MAX_RATE_LIMIT_WAIT_SECONDS) if delay is not None else None)
+
+
 _STATUS_HINTS = {
     400: "invalid request or API key",
     401: "check GEMINI_API_KEY",
@@ -606,6 +643,8 @@ class GeminiExtractionService:
             else _env_float("GEMINI_REQUEST_DELAY_SECONDS", 0.0)
         )
         self.max_retries = _env_int("GEMINI_MAX_RETRIES", DEFAULT_MAX_RETRIES, minimum=0)
+        self._spacing = 0.0  # extra pause before each request once a rate limit has been hit
+        self._requests_sent = 0
         self.max_output_tokens = _env_int("GEMINI_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS, minimum=1024)
         self.max_request_bytes = _env_int("GEMINI_MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES, minimum=1_000_000)
 
@@ -793,6 +832,9 @@ class GeminiExtractionService:
         headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
         retries = 0
         transport_retried = False
+        if self._spacing > 0 and self._requests_sent > 0:
+            self._sleep(self._spacing)
+        self._requests_sent += 1
         while True:
             try:
                 response = self._post(url, headers, payload, self.timeout_seconds)
@@ -807,10 +849,25 @@ class GeminiExtractionService:
                 raise GeminiExtractionError(f"Gemini request failed: {type(exc).__name__}") from None
 
             status = getattr(response, "status_code", 200)
+            suggested_wait: Optional[float] = None
+            if status == 429:
+                daily_quota, suggested_wait = _rate_limit_info(response)
+                if daily_quota:
+                    # Waiting a few minutes cannot help; say so instead of burning retries and requests.
+                    raise GeminiExtractionError(
+                        "Gemini API returned HTTP 429 (daily quota used up; it resets daily, "
+                        "or use a key or plan with a higher quota)"
+                    ) from None
             retryable = status == 429 or (isinstance(status, int) and status >= 500)
             if retryable and retries < self.max_retries:
                 delay = _retry_after_seconds(response)
-                self._sleep(delay if delay is not None else self._backoff(retries))
+                if status == 429:
+                    # Honour the longest hint: the API's own delay, the Retry-After header, or our backoff.
+                    wait = max(suggested_wait or 0.0, delay or 0.0, self._backoff(retries))
+                    self._spacing = max(self._spacing, RATE_LIMIT_SPACING_SECONDS)
+                else:
+                    wait = delay if delay is not None else self._backoff(retries)
+                self._sleep(wait)
                 retries += 1
                 continue
             if status != 200:

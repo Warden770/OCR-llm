@@ -531,6 +531,90 @@ def test_rate_limit_that_never_clears_reports_it(pages) -> None:
         service.extract_document(pages(1))
 
 
+def _rate_limited(retry_delay="34s", quota_id="GenerateRequestsPerMinutePerProjectPerModel-FreeTier", message="Quota exceeded"):
+    details = [{"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": [{"quotaId": quota_id}]}]
+    if retry_delay is not None:
+        details.append({"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": retry_delay})
+    return _response(status=429, body={"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": message, "details": details}})
+
+
+def test_the_suggested_retry_delay_is_honoured_and_later_requests_are_spaced_out(pages) -> None:
+    transport = FakeTransport(_rate_limited("34s"), _response(_payload(attributes=[])))
+    service, sleeps = _service(transport, pages_per_request=1)
+
+    service.extract_document(pages(2))
+
+    assert len(transport.calls) == 3  # page 1 (limited), page 1 again, page 2
+    assert sleeps == [34.0, 10.0]  # the API's own wait, then a pause before the next request
+
+
+def test_a_daily_quota_fails_at_once_instead_of_burning_retries(pages) -> None:
+    transport = FakeTransport(_rate_limited("5s", quota_id="GenerateRequestsPerDayPerProjectPerModel-FreeTier"))
+    service, sleeps = _service(transport)
+
+    with pytest.raises(GeminiExtractionError, match=r"HTTP 429 \(daily quota used up") as excinfo:
+        service.extract_document(pages(1))
+
+    assert len(transport.calls) == 1 and sleeps == []
+    assert not isinstance(excinfo.value, GeminiServiceError)
+
+
+def test_a_per_minute_token_limit_is_retried(pages) -> None:
+    transport = FakeTransport(
+        _rate_limited("12s", quota_id="GenerateContentInputTokensPerModelPerMinute-FreeTier"),
+        _response(_payload(attributes=[])),
+    )
+    service, sleeps = _service(transport)
+
+    service.extract_document(pages(1))
+
+    assert sleeps == [12.0]
+
+
+def test_the_retry_delay_is_capped_and_never_shorter_than_the_backoff(pages) -> None:
+    transport = FakeTransport(_rate_limited("9999s"), _rate_limited("1s"), _rate_limited("1s"), _response(_payload(attributes=[])))
+    service, sleeps = _service(transport)
+
+    service.extract_document(pages(1))
+
+    assert sleeps == [120.0, 4.0, 8.0]  # the cap; then the backoff, which is longer than the 1s the API asked for
+
+
+@pytest.mark.parametrize("retry_delay", ["soon", "-5s", "5", "", None, 7])
+def test_an_unreadable_retry_delay_falls_back_to_the_backoff(pages, retry_delay) -> None:
+    response = _rate_limited(retry_delay) if isinstance(retry_delay, (str, type(None))) else _response(
+        status=429, body={"error": {"details": [{"retryDelay": retry_delay}]}}
+    )
+    transport = FakeTransport(response, _response(_payload(attributes=[])))
+    service, sleeps = _service(transport)
+
+    service.extract_document(pages(1))
+
+    assert sleeps == [2.0]
+
+
+def test_a_429_whose_body_is_not_json_still_retries(pages) -> None:
+    def broken():
+        raise ValueError("html error page")
+
+    transport = FakeTransport(SimpleNamespace(status_code=429, json=broken, headers={}), _response(_payload(attributes=[])))
+    service, sleeps = _service(transport)
+
+    service.extract_document(pages(1))
+
+    assert sleeps == [2.0]
+
+
+def test_a_rate_limit_message_is_never_echoed(pages) -> None:
+    transport = FakeTransport(_rate_limited("1s", message=f"{RESPONSE_BODY_MARKER} {API_KEY}"))
+    service, _ = _service(transport)
+
+    with pytest.raises(GeminiExtractionError, match=r"HTTP 429") as excinfo:
+        service.extract_document(pages(1))
+
+    assert RESPONSE_BODY_MARKER not in str(excinfo.value) and API_KEY not in str(excinfo.value)
+
+
 def test_transport_error_is_retried_once_then_reports_type_only(pages) -> None:
     class ReadTimeout(Exception):
         pass
