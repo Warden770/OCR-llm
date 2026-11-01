@@ -65,10 +65,11 @@ If port 8000 is already occupied, the preflight check exits with a clear message
 | `GEMINI_IMAGE_MAX_EDGE` | Longest edge in pixels of the JPEG sent for each page, default `2048`. |
 | `GEMINI_TIMEOUT_SECONDS` | Per-request timeout, default `120` (`.env.example` sets `180`). |
 | `GEMINI_REQUEST_DELAY_SECONDS` | Pause between requests for one document, default `0`. Raise it to stay under free-tier rate limits. |
+| `GEMINI_MAX_RETRIES` | How many times a rate limit (429) or server error (5xx) is retried before the request fails, default `5`. |
 | `GEMINI_MAX_OUTPUT_TOKENS`, `GEMINI_MAX_REQUEST_BYTES` | Optional. Output limit per request (default `32768`) and the inline image budget per request (default about 18 MB). |
 | `SOFFICE_CMD`, `OCR_RASTER_DPI` | LibreOffice command for `.doc` conversion, and the DPI used when rasterizing PDFs (default `300`). |
 
-Rate limits (HTTP 429) and server errors (5xx) are retried up to three times with exponential backoff, honouring `Retry-After`. Error messages carry the HTTP status or reason only; request payloads, response bodies and the API key are never logged or raised.
+Rate limits (HTTP 429) and server errors (5xx, such as 503 when the service is overloaded) are retried up to five times, waiting 2, 4, 8, 16 and 30 seconds (or the `Retry-After` the API sends). If a multi-page request still fails with a server error, it is split in half and each half retried, because shorter answers fail less often when the service is struggling; a single page that still fails makes the document `FAILED` with the status in the message, and Retry runs it again. Error messages carry the HTTP status or reason; request payloads, response bodies and the API key are never logged or raised.
 
 **Privacy:** page images are sent to Google for every document. Gemini free-tier requests may be used by Google to improve its products, so do not use the free tier for confidential documents. This system has no offline mode.
 

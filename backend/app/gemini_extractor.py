@@ -44,7 +44,7 @@ DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_OUTPUT_TOKENS = 32768
 # Gemini accepts about 20 MB of inline data per request; stay under it with some headroom.
 DEFAULT_MAX_REQUEST_BYTES = 18_000_000
-MAX_RETRIES = 3
+DEFAULT_MAX_RETRIES = 5
 MAX_RETRY_AFTER_SECONDS = 60.0
 
 SYSTEM_PROMPT = (
@@ -115,6 +115,10 @@ _MODE_PROMPTS = {MODE_FULL: "", MODE_NO_TRANSCRIPTION: NO_TRANSCRIPTION_PROMPT, 
 
 class GeminiExtractionError(RuntimeError):
     """Raised when the Gemini call or its response cannot be used."""
+
+
+class GeminiServiceError(GeminiExtractionError):
+    """The API kept answering with a 5xx error (overload, outage, gateway timeout) after every retry."""
 
 
 class ExtractionCanceled(Exception):
@@ -578,6 +582,7 @@ class GeminiExtractionService:
             if request_delay_seconds is not None
             else _env_float("GEMINI_REQUEST_DELAY_SECONDS", 0.0)
         )
+        self.max_retries = _env_int("GEMINI_MAX_RETRIES", DEFAULT_MAX_RETRIES, minimum=0)
         self.max_output_tokens = _env_int("GEMINI_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS, minimum=1024)
         self.max_request_bytes = _env_int("GEMINI_MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES, minimum=1_000_000)
 
@@ -657,6 +662,12 @@ class GeminiExtractionService:
                     f"Gemini ran out of output tokens on page {chunk[0].number}; raise GEMINI_MAX_OUTPUT_TOKENS"
                 ) from None
             logger.info("Gemini response was truncated; splitting %d pages into two requests", len(chunk))
+            return self._split_and_extract(chunk, api_key, known_document_type, should_cancel, mode)
+        except GeminiServiceError:
+            if len(chunk) == 1:
+                raise
+            # Smaller requests mean shorter answers, which fail less often when the service is struggling.
+            logger.info("Gemini kept returning a server error; splitting %d pages into two requests", len(chunk))
             return self._split_and_extract(chunk, api_key, known_document_type, should_cancel, mode)
         except _RecitationStop:
             if len(chunk) > 1:
@@ -767,18 +778,21 @@ class GeminiExtractionService:
 
             status = getattr(response, "status_code", 200)
             retryable = status == 429 or (isinstance(status, int) and status >= 500)
-            if retryable and retries < MAX_RETRIES:
+            if retryable and retries < self.max_retries:
                 delay = _retry_after_seconds(response)
                 self._sleep(delay if delay is not None else self._backoff(retries))
                 retries += 1
                 continue
             if status != 200:
-                raise _status_error(status)
+                error = _status_error(status)
+                if isinstance(status, int) and status >= 500:
+                    raise GeminiServiceError(str(error)) from None
+                raise error
             return response
 
     @staticmethod
     def _backoff(attempt: int) -> float:
-        return float(min(2 ** attempt, 30))
+        return float(min(2 ** (attempt + 1), 30))
 
     @staticmethod
     def _read_response(response: Any) -> DocumentExtraction:

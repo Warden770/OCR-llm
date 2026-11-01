@@ -38,6 +38,7 @@ services:
       GEMINI_IMAGE_MAX_EDGE: ${GEMINI_IMAGE_MAX_EDGE:-2048}
       GEMINI_TIMEOUT_SECONDS: ${GEMINI_TIMEOUT_SECONDS:-120}
       GEMINI_REQUEST_DELAY_SECONDS: ${GEMINI_REQUEST_DELAY_SECONDS:-0}
+      GEMINI_MAX_RETRIES: ${GEMINI_MAX_RETRIES:-5}
     volumes:
       - ./uploads:/app/uploads
       - ./datasets:/app/datasets
@@ -74,6 +75,7 @@ services:
       GEMINI_IMAGE_MAX_EDGE: ${GEMINI_IMAGE_MAX_EDGE:-2048}
       GEMINI_TIMEOUT_SECONDS: ${GEMINI_TIMEOUT_SECONDS:-120}
       GEMINI_REQUEST_DELAY_SECONDS: ${GEMINI_REQUEST_DELAY_SECONDS:-0}
+      GEMINI_MAX_RETRIES: ${GEMINI_MAX_RETRIES:-5}
     volumes:
       - ./uploads:/app/uploads
       - ./datasets:/app/datasets
