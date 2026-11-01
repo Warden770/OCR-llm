@@ -12,7 +12,7 @@ An AI-based pipeline that ingests non-standard documents, rasterizes them into p
 
 Gemini sometimes refuses to reproduce text it has memorized (finish reason `RECITATION`), which happens with standard wording such as university vision and mission statements. The extractor then splits the request to find the page that triggers it and retries that page with less verbatim text: first without the full-page transcription (tables are kept), and only if that is stopped too, attributes only. Attributes from such a page still come back, but they cannot be checked against a transcription, so they are capped at 0.5 confidence and go to review.
 
-If Gemini cannot be reached or returns something unusable (missing or invalid key, rate limit, timeout, blocked or malformed response), the document is marked `FAILED` with a short readable reason, and Retry runs it again. There is no OCR fallback: Tesseract and OpenCV were removed.
+If Gemini cannot be reached or returns something unusable (missing or invalid key, rate limit, timeout, blocked or malformed response), the document is marked `FAILED` with a short readable reason, and Retry runs it again. There is no OCR fallback: Tesseract and OpenCV were removed. An answer that cannot be parsed as JSON (usually a very long one that was cut off) is handled like a RECITATION stop: a multi-page request is split in half, and a single page is retried with a shorter answer before the document fails with the page number.
 
 ### What is different from word-level OCR
 
