@@ -80,12 +80,26 @@ _BASE_SYSTEM_PROMPT = (
     "text must be covered by some attribute, copied exactly as printed and never summarized or paraphrased. "
     "Name the issuing organization from the letterhead, but leave out logos, decorations and repeated page "
     "footers. "
-    "Whenever a page contains a table, with or without ruled lines, return it in the tables list and not as "
-    "attributes. Return every row of the table, with the header row first, and exactly one string per column in "
-    "every row. Use an empty string for a blank cell and put the text of a merged cell in its first column. Keep "
-    "line breaks inside a cell as \\n and copy the cell text exactly as printed. When a table continues on the "
-    "next page, return the rows printed on each page as a separate table for that page, and do not invent a "
-    "header row that is not printed there. Use the table's printed heading as its title. "
+    "Tables: look at the page visually, using visible borders and lines, cell boundaries, text alignment and "
+    "positioning, the spatial relationships between text blocks, row and column arrangement, merged cells, "
+    "section boundaries and consistent spacing. Return every table in the tables list and do not also return its "
+    "contents as attributes. There are two kinds. A conventional table (table_type \"data\") has column headers, "
+    "several data rows and consistently aligned columns of short values. A form-like table (table_type \"form\") "
+    "is a bordered layout of labels, headings, paragraphs and merged cells: labels paired with information, long "
+    "paragraphs inside single cells, headings spanning columns, two-column or multi-column layouts and sections "
+    "arranged in a grid, even when it does not look like a spreadsheet. A bordered section with several cells, "
+    "headings, labels and paragraphs is a form-like table: keep its labels, values and paragraphs together as the "
+    "cells of that one table and never split them into independent attributes. Do not decide from the number of "
+    "rows or columns, column headers or numbers alone. Text that is not inside a bordered or aligned grid, such as "
+    "ordinary paragraphs, letter text or a standalone heading, is not a table. If bordered sections form one "
+    "continuous grid, return one table and use merged cells for the section headings. Describe each table as a "
+    "grid: row_count and column_count, and for every cell its zero-based row and column (of its top-left slot), "
+    "row_span and column_span when it is merged, its text copied exactly as printed in reading order with line "
+    "breaks kept as \\n, and is_header for header or heading cells; leave out the slots a merged cell covers. "
+    "Give column_widths and row_heights as relative sizes that follow the printed layout, and set bordered to "
+    "false only when there are no visible lines. If a table continues on the next page, return the rows printed "
+    "on each page as a separate table and do not invent a header row that is not printed there. Use the table's "
+    "printed heading as its title. "
     "Copy each value exactly as printed. Never invent or infer a value that is not printed. If a value is "
     "unreadable or missing, leave that attribute out. Do not guess. "
     "Confidence is a number from 0 to 1. Use a value below 0.75 for anything blurry, partial, handwritten "
@@ -130,11 +144,54 @@ class ExtractedAttribute:
 
 
 @dataclass
+class ExtractedCell:
+    row: int  # zero-based row of the top-left slot
+    column: int  # zero-based column of the top-left slot
+    text: str
+    row_span: int = 1
+    column_span: int = 1
+    is_header: bool = False
+
+
+@dataclass
 class ExtractedTable:
+    """A table or form-like grid as a set of cells; merged cells carry spans and the slots they cover are omitted."""
+
     page: int
-    rows: List[List[str]]
+    cells: List[ExtractedCell]
+    row_count: int
+    column_count: int
     title: str = ""
+    kind: str = "data"  # "data": conventional table; "form": bordered labels/paragraphs/merged-cell layout
     box: Optional[List[int]] = None  # [x0, y0, x1, y1] on a 0..1000 scale, or None
+    column_widths: Optional[List[float]] = None  # relative widths, one per column
+    row_heights: Optional[List[float]] = None  # relative heights, one per row
+    bordered: bool = True
+
+    @classmethod
+    def from_rows(
+        cls,
+        page: int,
+        rows: Sequence[Sequence[str]],
+        title: str = "",
+        box: Optional[List[int]] = None,
+        kind: str = "data",
+    ) -> "ExtractedTable":
+        """A plain grid without merged cells; the first row is a header row for conventional tables."""
+        cells = [
+            ExtractedCell(r, c, "" if value is None else str(value), is_header=(r == 0 and kind == "data"))
+            for r, row in enumerate(rows)
+            for c, value in enumerate(row)
+        ]
+        return cls(
+            page=page,
+            cells=cells,
+            row_count=len(rows),
+            column_count=max((len(row) for row in rows), default=0),
+            title=title,
+            kind=kind,
+            box=box,
+        )
 
 
 @dataclass
@@ -219,10 +276,31 @@ def _build_response_schema(request_boxes: bool = False) -> Dict[str, Any]:
                     "properties": {
                         "page": {"type": "integer"},
                         "title": {"type": "string"},
-                        "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+                        "table_type": {"type": "string", "enum": ["data", "form"]},
+                        "bordered": {"type": "boolean"},
+                        "row_count": {"type": "integer"},
+                        "column_count": {"type": "integer"},
+                        "column_widths": {"type": "array", "items": {"type": "number"}},
+                        "row_heights": {"type": "array", "items": {"type": "number"}},
+                        "cells": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "row": {"type": "integer"},
+                                    "column": {"type": "integer"},
+                                    "row_span": {"type": "integer"},
+                                    "column_span": {"type": "integer"},
+                                    "text": {"type": "string"},
+                                    "is_header": {"type": "boolean"},
+                                },
+                                "required": ["row", "column", "text"],
+                                "additionalProperties": False,
+                            },
+                        },
                         **box_property,
                     },
-                    "required": ["page", "rows"],
+                    "required": ["page", "table_type", "row_count", "column_count", "cells"],
                     "additionalProperties": False,
                 },
             },
@@ -299,6 +377,87 @@ def _parse_box(raw: Any, size: Optional[tuple[int, int]]) -> Optional[List[int]]
     return [x0, y0, x1, y1]
 
 
+MAX_TABLE_ROWS = 500
+MAX_TABLE_COLUMNS = 100
+
+
+def _parse_weights(raw: Any, expected: int) -> Optional[List[float]]:
+    """Relative sizes: one positive number per row or column, otherwise ignored (layout falls back to even)."""
+    if not isinstance(raw, list) or len(raw) != expected or expected == 0:
+        return None
+    numbers = [_as_number(item) for item in raw]
+    if any(number is None or number <= 0 for number in numbers):
+        return None
+    return [float(number) for number in numbers]  # type: ignore[arg-type]
+
+
+def _parse_table(item: Any, box: Optional[List[int]]) -> Optional[ExtractedTable]:
+    """Validate one table from the response; ``None`` means malformed (the caller skips it and counts it)."""
+    if not isinstance(item, dict):
+        return None
+    page = _as_int(item.get("page"))
+    if page is None:
+        return None
+    title = item.get("title")
+    kind = "form" if str(item.get("table_type", "")).strip().lower() == "form" else "data"
+    bordered = item.get("bordered")
+    raw_cells = item.get("cells")
+    declared_rows = _as_int(item.get("row_count")) or 0
+    declared_columns = _as_int(item.get("column_count")) or 0
+
+    cells: List[ExtractedCell] = []
+    if isinstance(raw_cells, list):
+        flagged_headers = any(isinstance(raw, dict) and "is_header" in raw for raw in raw_cells)
+        for raw in raw_cells:
+            if not isinstance(raw, dict):
+                return None
+            row, column = _as_int(raw.get("row")), _as_int(raw.get("column"))
+            if row is None or column is None or row < 0 or column < 0:
+                return None
+            text = raw.get("text")
+            is_header = raw.get("is_header") is True or (not flagged_headers and kind == "data" and row == 0)
+            cells.append(
+                ExtractedCell(
+                    row=row,
+                    column=column,
+                    text="" if text is None else str(text),
+                    row_span=max(1, _as_int(raw.get("row_span")) or 1),
+                    column_span=max(1, _as_int(raw.get("column_span")) or 1),
+                    is_header=is_header,
+                )
+            )
+    else:
+        # Older shape: plain rows of strings without merged cells.
+        rows = item.get("rows")
+        if not isinstance(rows, list) or not all(isinstance(row, list) for row in rows):
+            return None
+        return _finish_table(
+            ExtractedTable.from_rows(page, [["" if v is None else str(v) for v in row] for row in rows], kind=kind),
+            title, box, bordered, item,
+        )
+
+    table = ExtractedTable(page=page, cells=cells, row_count=declared_rows, column_count=declared_columns, kind=kind)
+    return _finish_table(table, title, box, bordered, item)
+
+
+def _finish_table(
+    table: ExtractedTable, title: Any, box: Optional[List[int]], bordered: Any, item: Dict[str, Any]
+) -> Optional[ExtractedTable]:
+    if not table.cells:
+        return None
+    # The grid is at least as large as the cells need, whatever size the model declared.
+    table.row_count = max(table.row_count, max(cell.row + cell.row_span for cell in table.cells))
+    table.column_count = max(table.column_count, max(cell.column + cell.column_span for cell in table.cells))
+    if table.row_count > MAX_TABLE_ROWS or table.column_count > MAX_TABLE_COLUMNS:
+        return None
+    table.title = title if isinstance(title, str) else ""
+    table.box = box
+    table.bordered = bordered if isinstance(bordered, bool) else True
+    table.column_widths = _parse_weights(item.get("column_widths"), table.column_count)
+    table.row_heights = _parse_weights(item.get("row_heights"), table.row_count)
+    return table
+
+
 def _schema_error() -> ClaudeExtractionError:
     return ClaudeExtractionError("Claude response did not match the expected structure")
 
@@ -358,19 +517,12 @@ def _parse_payload(data: Any, sizes: Optional[Dict[int, tuple[int, int]]] = None
     skipped_tables = 0
     for item in tables:
         page = _as_int(item.get("page")) if isinstance(item, dict) else None
-        rows = item.get("rows") if isinstance(item, dict) else None
-        if page is None or not isinstance(rows, list) or not all(isinstance(row, list) for row in rows):
+        box = _parse_box(item.get("box"), sizes.get(page)) if isinstance(item, dict) and page is not None else None
+        table = _parse_table(item, box)
+        if table is None:
             skipped_tables += 1
             continue
-        title = item.get("title")
-        result.tables.append(
-            ExtractedTable(
-                page=page,
-                rows=[["" if cell is None else str(cell) for cell in row] for row in rows],
-                title=title if isinstance(title, str) else "",
-                box=_parse_box(item.get("box"), sizes.get(page)),
-            )
-        )
+        result.tables.append(table)
     if skipped_tables:
         logger.warning("Ignored %d malformed table(s) in a Claude response", skipped_tables)
 
@@ -717,6 +869,38 @@ def _clamp_confidence(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+# An attribute whose whole value sits inside a table cell is that table's content, not a separate text field.
+MIN_TABLE_DEDUP_LENGTH = 6
+
+
+def _boxes_overlap(a: Sequence[int], b: Sequence[int]) -> bool:
+    return min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1])
+
+
+def _table_cell_texts(extraction: DocumentExtraction) -> Dict[int, List[tuple[Optional[List[int]], List[str]]]]:
+    """Per page: (table box, normalized cell texts) for every table that has any text."""
+    by_page: Dict[int, List[tuple[Optional[List[int]], List[str]]]] = {}
+    for table in extraction.tables:
+        texts = [normalized for normalized in (_normalize_text(cell.text) for cell in table.cells) if normalized]
+        if texts:
+            by_page.setdefault(table.page, []).append((table.box, texts))
+    return by_page
+
+
+def _is_table_content(
+    value: str, page: int, box: Optional[List[int]], tables: Dict[int, List[tuple[Optional[List[int]], List[str]]]]
+) -> bool:
+    normalized = _normalize_text(value)
+    if len(normalized) < MIN_TABLE_DEDUP_LENGTH:
+        return False
+    for table_box, texts in tables.get(page, ()):
+        if box and table_box and not _boxes_overlap(box, table_box):
+            continue  # located outside this table
+        if any(normalized in text for text in texts):
+            return True
+    return False
+
+
 def build_attribute_payloads(
     extraction: DocumentExtraction,
     page_ids: Dict[int, int],
@@ -734,6 +918,7 @@ def build_attribute_payloads(
     """
     document_type = normalize_document_type(extraction.document_type)
     normalized_pages = {number: _normalize_text(text) for number, text in extraction.page_text.items()}
+    table_texts = _table_cell_texts(extraction)
     best: Dict[tuple[int, str, str], Dict[str, Any]] = {}
     ordered: List[tuple[int, str, str]] = []
 
@@ -742,6 +927,8 @@ def build_attribute_payloads(
         value = item.value.strip()
         if not label or not value or item.page not in page_ids:
             continue
+        if _is_table_content(value, item.page, item.box, table_texts):
+            continue  # the value is part of a table; it stays in the table rather than becoming a text field
 
         confidence = _clamp_confidence(item.confidence)
         if _normalize_text(value) not in normalized_pages.get(item.page, ""):
@@ -769,81 +956,119 @@ def build_attribute_payloads(
     return [best[key] for key in ordered]
 
 
+def _place_cells(table: ExtractedTable) -> List[ExtractedCell]:
+    """Clip spans to the grid, drop a cell that overlaps an earlier one, and fill uncovered slots with blank cells.
+
+    The result is a complete grid: every slot is covered by exactly one cell, which is what the table card needs
+    to render merged cells correctly.
+    """
+    occupied: set[tuple[int, int]] = set()
+    placed: List[ExtractedCell] = []
+    for cell in sorted(table.cells, key=lambda item: (item.row, item.column)):
+        if cell.row >= table.row_count or cell.column >= table.column_count:
+            continue
+        row_span = min(cell.row_span, table.row_count - cell.row)
+        column_span = min(cell.column_span, table.column_count - cell.column)
+        slots = {(cell.row + dr, cell.column + dc) for dr in range(row_span) for dc in range(column_span)}
+        if slots & occupied:
+            logger.warning("Dropped a table cell that overlaps another cell")
+            continue
+        occupied |= slots
+        placed.append(ExtractedCell(cell.row, cell.column, cell.text.strip(), row_span, column_span, cell.is_header))
+    for row in range(table.row_count):
+        for column in range(table.column_count):
+            if (row, column) not in occupied:
+                placed.append(ExtractedCell(row, column, ""))
+    return sorted(placed, key=lambda item: (item.row, item.column))
+
+
+def _cumulative(weights: Optional[List[float]], count: int) -> List[float]:
+    """Boundaries 0..1 of ``count`` slots from relative sizes (even when none were given)."""
+    sizes = weights if weights and len(weights) == count else [1.0] * count
+    total = sum(sizes)
+    bounds = [0.0]
+    for size in sizes:
+        bounds.append(bounds[-1] + size / total)
+    return bounds
+
+
 def build_table_layouts(
     extraction: DocumentExtraction,
     page_ids: Dict[int, int],
 ) -> Dict[int, List[Dict[str, Any]]]:
     """Turn Claude's tables into the cell structure the review screen's table card renders.
 
-    Claude returns rows of text and, at best, one box per table, so cell boxes are an even split of
-    the table box and every cell is marked ``uncertain``. Tables on pages outside the document are
+    Conventional tables and form-like layouts use the same structure: a grid of cells with row/column spans for
+    merged cells. Column widths and row heights follow Claude's relative estimates (even when it gave none);
+    when the table has a box, each cell's box is derived from it. Every cell is marked ``uncertain`` because the
+    structure is a visual reading. Tables on pages outside the document, and tables with no text at all, are
     dropped. Returns ``{page_number: [table, ...]}``.
     """
     layouts: Dict[int, List[Dict[str, Any]]] = {}
     for table in extraction.tables:
-        if table.page not in page_ids:
+        if table.page not in page_ids or not any(cell.text.strip() for cell in table.cells):
             continue
-        rows = [row for row in table.rows if any(cell.strip() for cell in row)]
-        column_count = max((len(row) for row in rows), default=0)
-        if not rows or column_count == 0:
-            continue
-
-        page_tables = layouts.setdefault(table.page, [])
-        table_id = f"page-{table.page}-table-{len(page_tables) + 1}"
-        x0, y0, x1, y1 = table.box if table.box else (0, 0, 0, 0)
+        placed = _place_cells(table)
+        column_bounds = _cumulative(table.column_widths, table.column_count)
+        row_bounds = _cumulative(table.row_heights, table.row_count)
         has_box = bool(table.box)
-        row_height = (y1 - y0) / len(rows) if has_box else 0.0
-        column_width = (x1 - x0) / column_count if has_box else 0.0
+        x0, y0, x1, y1 = table.box if table.box else (0, 0, 0, 0)
+
+        def slot_box(cell: ExtractedCell) -> List[int]:
+            if not has_box:
+                return []
+            return [
+                round(x0 + (x1 - x0) * column_bounds[cell.column]),
+                round(y0 + (y1 - y0) * row_bounds[cell.row]),
+                round(x0 + (x1 - x0) * column_bounds[cell.column + cell.column_span]),
+                round(y0 + (y1 - y0) * row_bounds[cell.row + cell.row_span]),
+            ]
 
         built_rows: List[Dict[str, Any]] = []
-        for row_index, row in enumerate(rows):
-            cells: List[Dict[str, Any]] = []
-            for column_index in range(column_count):
-                text = row[column_index].strip() if column_index < len(row) else ""
-                cell_box = (
-                    [
-                        round(x0 + column_index * column_width),
-                        round(y0 + row_index * row_height),
-                        round(x0 + (column_index + 1) * column_width),
-                        round(y0 + (row_index + 1) * row_height),
-                    ]
-                    if has_box
-                    else []
-                )
-                cells.append(
-                    {
-                        "id": f"r{row_index}-c{column_index}",
-                        "row_index": row_index,
-                        "column_index": column_index,
-                        "text": text,
-                        "original_text": text,
-                        "bbox": cell_box,
-                        "rowspan": 1,
-                        "colspan": 1,
-                        "is_header": row_index == 0,
-                        "bold": row_index == 0,
-                        "alignment": "left",
-                        "font_scale": 1.0,
-                        # Claude gives no per-cell confidence; keep structure below the review threshold.
-                        "confidence_score": TABLE_CONFIDENCE,
-                        "token_indices": [],
-                        "uncertain": True,
-                    }
-                )
-            built_rows.append({"index": row_index, "cells": cells, "height": round(row_height, 2)})
+        for row_index in range(table.row_count):
+            cells = [
+                {
+                    "id": f"r{cell.row}-c{cell.column}",
+                    "row_index": cell.row,
+                    "column_index": cell.column,
+                    "text": cell.text,
+                    "original_text": cell.text,
+                    "bbox": slot_box(cell),
+                    "rowspan": cell.row_span,
+                    "colspan": cell.column_span,
+                    "is_header": cell.is_header,
+                    "bold": cell.is_header,
+                    "alignment": "left",
+                    "font_scale": 1.0,
+                    # No per-cell confidence is given; keep structure below the review threshold.
+                    "confidence_score": TABLE_CONFIDENCE,
+                    "token_indices": [],
+                    "uncertain": True,
+                }
+                for cell in placed
+                if cell.row == row_index
+            ]
+            height = (y1 - y0) * (row_bounds[row_index + 1] - row_bounds[row_index]) if has_box else 0.0
+            built_rows.append({"index": row_index, "cells": cells, "height": round(height, 2)})
 
+        page_tables = layouts.setdefault(table.page, [])
         box = list(table.box) if table.box else []
         page_tables.append(
             {
-                "id": table_id,
+                "id": f"page-{table.page}-table-{len(page_tables) + 1}",
                 "page_id": page_ids[table.page],
                 "page_number": table.page,
                 "title": table.title.strip() or f"Table {len(page_tables) + 1}",
                 "caption": "",
+                "table_type": table.kind,
                 "bbox": box,
-                "columns": [round(BOX_SCALE / column_count, 2)] * column_count,
+                "columns": [round(BOX_SCALE * (b - a), 2) for a, b in zip(column_bounds, column_bounds[1:])],
                 "rows": built_rows,
-                "style": {"bordered": False, "border_width": 0, "layout_source": "claude"},
+                "style": {
+                    "bordered": table.bordered,
+                    "border_width": 1 if table.bordered else 0,
+                    "layout_source": "claude",
+                },
                 "confidence_score": TABLE_CONFIDENCE,
                 "uncertain_fields": ["cell_boundaries", "merged_cells", "font_emphasis"],
                 "source": "claude",

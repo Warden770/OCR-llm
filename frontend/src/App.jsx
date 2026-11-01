@@ -673,6 +673,13 @@ function normalizeDocumentAttributes(attributes) {
 function isStructuredTable(table) {
   const rows = Array.isArray(table?.rows) ? table.rows : []
   const columns = Array.isArray(table?.columns) ? table.columns : []
+  if (table?.source === 'gemini' || table?.source === 'claude') {
+    // The model judged this region to be a table from its borders, cell boundaries and layout, so it is not
+    // second-guessed by counting rows or filled cells: form-like tables have few records, merged cells and
+    // long paragraphs, and are still tables.
+    const cellCount = rows.reduce((sum, row) => sum + (row.cells || []).length, 0)
+    return rows.length >= 1 && columns.length >= 1 && cellCount >= 2
+  }
   if (rows.length < 2 || columns.length < 2) {
     return false
   }
@@ -1684,7 +1691,7 @@ function ReconstructedTableCard({
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-[150px] flex-1">
             <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
-              {table.style?.layout_source === 'claude' ? 'Claude table reading' : 'Reconstructed table'}
+              {table.table_type === 'form' ? 'Form-like table' : table.style?.layout_source === 'claude' ? 'Claude table reading' : 'Reconstructed table'}
               {' · Page '}{table.page_number}
             </p>
             <input
@@ -1770,6 +1777,13 @@ function ReconstructedTableCard({
                               aria-label={`Cell ${rowIndex + 1}, ${Number(cell.column_index || 0) + 1}`}
                               value={cell.text || ''}
                               rows={Math.min(14, Math.max(1, String(cell.text || '').split('\n').length))}
+                              ref={(element) => {
+                                // Grow with the content so long paragraphs in form-like cells are fully visible.
+                                if (element) {
+                                  element.style.height = 'auto'
+                                  element.style.height = `${element.scrollHeight}px`
+                                }
+                              }}
                               onClick={(event) => event.stopPropagation()}
                               onChange={(event) => onEditCell(table.id, cell.id, event.target.value)}
                               className={`w-full min-w-[52px] resize-y overflow-hidden rounded-sm bg-transparent p-0.5 text-xs leading-4 outline-none focus:bg-white focus:ring-1 focus:ring-cyan-600 ${cell.bold || cell.is_header ? 'font-semibold' : 'font-normal'}`}

@@ -17,7 +17,7 @@ If Claude cannot be reached or returns something unusable (missing or invalid ke
 - Claude's confidence is its own rating, not a measured accuracy like per-word OCR confidence. Treat it as a review signal.
 - **Regions are off by default.** Anthropic documents Claude's pixel coordinates as approximate, and a wrong box is worse than none, so the page viewer shows no highlighted regions unless you set `CLAUDE_REQUEST_BOXES=true`. Attributes stay selectable from the side panel either way. Word-level highlighting and per-word confidence no longer exist.
 - Attribute names can vary a little between documents of the same type, because nothing fixes them.
-- Tables come back as text rows. Without regions, table cells have no boxes, and every cell is marked uncertain.
+- **Tables.** Claude reads each page visually (borders and lines, cell boundaries, alignment, merged cells, section boundaries) and returns both conventional tables and form-like layouts (bordered sections of labels, headings, long paragraphs and merged cells) as one grid of cells with row and column spans, plus relative column widths and row heights. A form-like table stays one table in the Tables tab and its contents are not repeated as separate text fields; ordinary paragraphs outside a grid are not tables. The layout is a visual reading, so every cell is marked uncertain. Cell boxes exist only when regions are enabled (`CLAUDE_REQUEST_BOXES=true`).
 
 ## Stack
 

@@ -149,7 +149,7 @@ def test_processing_stages_attributes_without_persisting(
             document_type="Sales Invoice",
             page_text={1: "Total Amount 123.45"},
             attributes=[ExtractedAttribute("Total Amount", "123.45", 0.91, 1, box=[10, 20, 30, 40])],
-            tables=[ExtractedTable(page=1, title="Items", rows=[["Item", "Price"], ["Pen", "123.45"]], box=[0, 100, 500, 300])],
+            tables=[ExtractedTable.from_rows(1, [["Item", "Price"], ["Pen", "123.45"]], title="Items", box=[0, 100, 500, 300])],
         ),
         calls=claude_calls,
     )

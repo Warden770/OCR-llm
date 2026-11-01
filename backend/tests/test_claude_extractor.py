@@ -17,6 +17,7 @@ from app.claude_extractor import (
     ClaudeExtractionService,
     DocumentExtraction,
     ExtractedAttribute,
+    ExtractedCell,
     ExtractedTable,
     ExtractionCanceled,
     _encode_image,
@@ -161,25 +162,18 @@ def test_request_shape_key_only_in_header_structured_output_and_no_attribute_enu
     output_format = payload["output_config"]["format"]
     assert output_format["type"] == "json_schema"
     schema = output_format["schema"]
-    assert '"enum"' not in json.dumps(schema)
+    assert '"enum"' not in json.dumps(schema["properties"]["attributes"])  # attribute names are free-form
+    table_props = schema["properties"]["tables"]["items"]["properties"]
+    assert table_props["table_type"]["enum"] == ["data", "form"]
+    assert {"cells", "row_count", "column_count", "column_widths", "row_heights", "bordered"} <= set(table_props)
+    assert {"row", "column", "row_span", "column_span", "text", "is_header"} == set(table_props["cells"]["items"]["properties"])
     assert schema["properties"]["attributes"]["items"]["properties"]["attribute"] == {"type": "string"}
     assert all(obj.get("additionalProperties") is False for obj in _walk_objects(schema))
     assert "box" not in schema["properties"]["attributes"]["items"]["properties"]
     assert "region" not in payload["system"] and "pixels" not in payload["system"]
 
 
-def test_prompt_asks_for_the_body_of_letters_not_only_labelled_fields(pages) -> None:
-    transport = FakeTransport(_response(_payload(attributes=[])))
-    service, _ = _service(transport)
-
-    service.extract_document(pages(1))
-
-    prompt = transport.calls[0]["payload"]["system"]
-    for expected in ("letters, memos", "main body", "one item per line", "never summarized or paraphrased"):
-        assert expected in prompt
-
-
-def test_prompt_and_task_ask_for_every_table_in_the_tables_list(pages) -> None:
+def test_prompt_asks_for_the_body_of_letters_and_both_kinds_of_tables(pages) -> None:
     transport = FakeTransport(_response(_payload(attributes=[])))
     service, _ = _service(transport)
 
@@ -187,9 +181,16 @@ def test_prompt_and_task_ask_for_every_table_in_the_tables_list(pages) -> None:
 
     call = transport.calls[0]
     prompt = call["payload"]["system"]
-    for expected in ("return it in the tables list and not as attributes", "header row first", "exactly one string per column", "continues on the next page"):
+    for expected in (
+        "letters, memos", "main body", "one item per line", "never summarized or paraphrased",
+        "visible borders and lines", "merged cells", "conventional table", "form-like table",
+        "never split them into independent attributes", "Do not decide from the number of rows or columns",
+        "is not a table", "row_span and column_span", "column_widths and row_heights", "continues on the next page",
+    ):
         assert expected in prompt
     assert "every table on these pages in the tables list" in _content(call)[-1]["text"]
+
+
 
 
 def test_default_model_comes_from_environment_then_constant(monkeypatch) -> None:
@@ -294,13 +295,22 @@ def test_regions_are_only_requested_when_enabled_and_pixels_are_scaled_to_the_pa
     ]
 
 
-def test_table_regions_use_the_same_pixel_scale(pages) -> None:
-    tables = [{"page": 1, "title": "T", "rows": [["a", "b"]], "box": [100, 20, 200, 80]}]
-    service, _ = _service(FakeTransport(_response(_payload(attributes=[], tables=tables))), request_boxes=True)
+def test_table_regions_use_the_same_pixel_scale_and_are_only_requested_when_enabled(pages) -> None:
+    item = _table_item(box=[100, 20, 200, 80])  # pixels of a 200x100 page image
+    transport = FakeTransport(_response(_payload(attributes=[], tables=[item])))
+    service, _ = _service(transport, request_boxes=True)
 
     result = service.extract_document(pages(1))
 
     assert result.tables[0].box == [500, 200, 1000, 800]
+    table_props = transport.calls[0]["payload"]["output_config"]["format"]["schema"]["properties"]["tables"]["items"]["properties"]
+    assert table_props["box"] == {"type": "array", "items": {"type": "integer"}}
+
+    off = FakeTransport(_response(_payload(attributes=[])))
+    _service(off)[0].extract_document(pages(1))
+    off_props = off.calls[0]["payload"]["output_config"]["format"]["schema"]["properties"]["tables"]["items"]["properties"]
+    assert "box" not in off_props
+
 
 
 # ---------------------------------------------------------------------------
@@ -578,15 +588,14 @@ def test_responses_that_do_not_match_the_schema_fail(pages, payload) -> None:
         service.extract_document(pages(1))
 
 
-def test_optional_fields_default_and_malformed_tables_are_ignored_not_fatal(pages) -> None:
-    tables = [{"page": 1, "rows": "nope"}, {"rows": [["a"]]}, {"page": 1, "title": "Ok", "rows": [["a", None], ["b", "c"]]}]
-    service, _ = _service(FakeTransport(_response(_payload(attributes=[_attribute()], tables=tables))))
+def test_optional_fields_default(pages) -> None:
+    service, _ = _service(FakeTransport(_response(_payload(attributes=[_attribute()]))))
 
     result = service.extract_document(pages(1))
 
     assert result.attributes[0].continues_from_previous_page is False
-    assert len(result.tables) == 1
-    assert result.tables[0].rows == [["a", ""], ["b", "c"]]
+    assert result.tables == []
+
 
 
 # ---------------------------------------------------------------------------
@@ -756,38 +765,259 @@ def test_document_type_is_normalized(raw, expected) -> None:
 # tables
 # ---------------------------------------------------------------------------
 
-def test_tables_become_review_cards_with_evenly_split_cell_boxes() -> None:
+
+# ---------------------------------------------------------------------------
+# tables: conventional tables and form-like layouts with merged cells
+# ---------------------------------------------------------------------------
+
+def _table_item(**overrides) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "page": 1,
+        "title": "Subjects",
+        "table_type": "data",
+        "row_count": 2,
+        "column_count": 2,
+        "cells": [
+            {"row": 0, "column": 0, "text": "Code"},
+            {"row": 0, "column": 1, "text": "Title"},
+            {"row": 1, "column": 0, "text": "IT101"},
+            {"row": 1, "column": 1, "text": "Intro"},
+        ],
+    }
+    item.update(overrides)
+    return item
+
+
+def _read_tables(pages, service_factory, *items):
+    transport = FakeTransport(_response(_payload(attributes=[], tables=list(items))))
+    service, _ = service_factory(transport)
+    return service.extract_document(pages(1)).tables
+
+
+FORM_CELLS = [
+    {"row": 0, "column": 0, "column_span": 2, "text": "University Vision and Mission", "is_header": True},
+    {"row": 1, "column": 0, "text": "Vision", "is_header": True},
+    {"row": 1, "column": 1, "text": "A globally engaged university."},
+    {"row": 2, "column": 0, "row_span": 2, "text": "Goals\nResearch. Instruction. Production."},
+    {"row": 2, "column": 1, "text": "Objectives"},
+    {"row": 3, "column": 1, "text": "1. To train students.\n2. To provide skills."},
+]
+
+
+def test_a_form_like_table_keeps_merged_cells_headings_and_long_text_in_one_table(pages) -> None:
+    item = _table_item(title="Vision, Mission and Goals", table_type="form", row_count=4, column_count=2, cells=FORM_CELLS)
+
+    (table,) = _read_tables(pages, _service, item)
+
+    assert (table.kind, table.row_count, table.column_count, table.bordered) == ("form", 4, 2, True)
+    banner = table.cells[0]
+    assert (banner.row, banner.column, banner.column_span, banner.row_span, banner.is_header) == (0, 0, 2, 1, True)
+    goals = next(cell for cell in table.cells if cell.text.startswith("Goals"))
+    assert (goals.row_span, goals.column_span) == (2, 1)
+    assert "\n" in table.cells[-1].text  # line breaks inside a cell are kept
+
+
+def test_merged_cells_become_spans_and_covered_slots_are_not_repeated() -> None:
+    table = ExtractedTable(page=1, cells=[_cell(c) for c in FORM_CELLS], row_count=4, column_count=2, kind="form")
+
+    built = build_table_layouts(DocumentExtraction(tables=[table]), {1: 11})[1][0]
+
+    assert built["table_type"] == "form"
+    rows = built["rows"]
+    assert [len(row["cells"]) for row in rows] == [1, 2, 2, 1]  # banner spans both columns; goals spans two rows
+    banner = rows[0]["cells"][0]
+    assert (banner["rowspan"], banner["colspan"], banner["is_header"], banner["bold"]) == (1, 2, True, True)
+    goals = rows[2]["cells"][0]
+    assert (goals["rowspan"], goals["colspan"]) == (2, 1)
+    assert rows[3]["cells"][0]["column_index"] == 1  # row 3 only has the slot the merged cell does not cover
+    assert built["style"] == {"bordered": True, "border_width": 1, "layout_source": "claude"}
+    assert built["source"] == "claude"
+
+
+def _cell(raw: dict[str, Any]) -> ExtractedCell:
+    return ExtractedCell(
+        row=raw["row"],
+        column=raw["column"],
+        text=raw["text"],
+        row_span=raw.get("row_span", 1),
+        column_span=raw.get("column_span", 1),
+        is_header=raw.get("is_header", False),
+    )
+
+
+def test_missing_slots_are_filled_with_blank_cells_so_every_row_is_complete() -> None:
+    table = ExtractedTable(page=1, cells=[ExtractedCell(0, 0, "a"), ExtractedCell(1, 1, "d")], row_count=2, column_count=3)
+
+    built = build_table_layouts(DocumentExtraction(tables=[table]), {1: 1})[1][0]
+
+    assert [[cell["text"] for cell in row["cells"]] for row in built["rows"]] == [["a", "", ""], ["", "d", ""]]
+    assert built["columns"] == [333.33, 333.33, 333.33]
+
+
+def test_an_overlapping_cell_is_dropped_and_the_first_one_wins() -> None:
+    table = ExtractedTable(
+        page=1,
+        cells=[ExtractedCell(0, 0, "wide", column_span=2), ExtractedCell(0, 1, "overlap"), ExtractedCell(1, 0, "x"), ExtractedCell(1, 1, "y")],
+        row_count=2,
+        column_count=2,
+    )
+
+    built = build_table_layouts(DocumentExtraction(tables=[table]), {1: 1})[1][0]
+
+    assert [[cell["text"] for cell in row["cells"]] for row in built["rows"]] == [["wide"], ["x", "y"]]
+
+
+def test_the_grid_grows_to_fit_the_cells_and_spans_are_clipped_by_the_declared_size(pages) -> None:
+    # declared 1x1 but cells reach row 2 / column 1: the grid is at least as large as the cells need
+    item = _table_item(row_count=1, column_count=1, cells=[{"row": 2, "column": 1, "text": "far", "column_span": 2}, {"row": 0, "column": 0, "text": "near"}])
+
+    (table,) = _read_tables(pages, _service, item)
+
+    assert (table.row_count, table.column_count) == (3, 3)
+    built = build_table_layouts(DocumentExtraction(tables=[table]), {1: 1})[1][0]
+    assert [len(row["cells"]) for row in built["rows"]] == [3, 3, 2]
+
+
+def test_relative_widths_and_heights_set_the_columns_and_cell_boxes() -> None:
+    table = ExtractedTable(
+        page=1,
+        cells=[ExtractedCell(0, 0, "label"), ExtractedCell(0, 1, "paragraph"), ExtractedCell(1, 0, "x", column_span=2)],
+        row_count=2,
+        column_count=2,
+        box=[0, 100, 1000, 300],
+        column_widths=[1, 3],
+        row_heights=[3, 1],
+    )
+
+    built = build_table_layouts(DocumentExtraction(tables=[table]), {1: 1})[1][0]
+
+    assert built["columns"] == [250.0, 750.0]
+    assert [row["height"] for row in built["rows"]] == [150.0, 50.0]
+    assert built["rows"][0]["cells"][1]["bbox"] == [250, 100, 1000, 250]
+    assert built["rows"][1]["cells"][0]["bbox"] == [0, 250, 1000, 300]  # a merged cell covers both columns
+
+
+@pytest.mark.parametrize("widths", [[1], [1, 2, 3], [1, 0], [1, -2], ["a", 1], "wide", None])
+def test_unusable_widths_fall_back_to_even_columns(pages, widths) -> None:
+    (table,) = _read_tables(pages, _service, _table_item(column_widths=widths))
+
+    assert table.column_widths is None
+    built = build_table_layouts(DocumentExtraction(tables=[table]), {1: 1})[1][0]
+    assert built["columns"] == [500.0, 500.0]
+
+
+def test_headers_default_to_the_first_row_only_for_conventional_tables_without_flags(pages) -> None:
+    data, form, flagged = _read_tables(
+        pages,
+        _service,
+        _table_item(),
+        _table_item(table_type="form"),
+        _table_item(cells=[{"row": 0, "column": 0, "text": "a"}, {"row": 1, "column": 0, "text": "b", "is_header": True}]),
+    )
+
+    assert [cell.is_header for cell in data.cells] == [True, True, False, False]
+    assert [cell.is_header for cell in form.cells] == [False] * 4
+    assert [cell.is_header for cell in flagged.cells] == [False, True]  # the model's own flags win
+
+
+def test_table_kind_and_borders_are_read_with_safe_defaults(pages) -> None:
+    unknown, upper, borderless = _read_tables(
+        pages, _service, _table_item(table_type="spreadsheet"), _table_item(table_type=" FORM "), _table_item(bordered=False)
+    )
+
+    assert (unknown.kind, upper.kind, unknown.bordered) == ("data", "form", True)
+    assert borderless.bordered is False
+    built = build_table_layouts(DocumentExtraction(tables=[borderless]), {1: 1})[1][0]
+    assert built["style"]["bordered"] is False and built["style"]["border_width"] == 0
+
+
+def test_the_older_rows_of_strings_shape_is_still_accepted(pages) -> None:
+    legacy = {"page": 1, "title": "Ok", "rows": [["a", None], ["b", "c"]]}
+
+    (table,) = _read_tables(pages, _service, legacy)
+
+    assert [(c.row, c.column, c.text, c.is_header) for c in table.cells] == [(0, 0, "a", True), (0, 1, "", True), (1, 0, "b", False), (1, 1, "c", False)]
+    assert (table.row_count, table.column_count) == (2, 2)
+
+
+def test_malformed_tables_are_skipped_without_failing_the_page(pages) -> None:
+    bad = [
+        {"page": 1, "rows": "nope"},
+        {"rows": [["a"]]},  # no page
+        _table_item(cells=[]),
+        _table_item(cells=["not a cell"]),
+        _table_item(cells=[{"row": -1, "column": 0, "text": "x"}]),
+        _table_item(cells=[{"row": "one", "column": 0, "text": "x"}]),
+        _table_item(cells=[{"row": 0, "column": 0, "text": "x", "row_span": 100000}]),
+        "text",
+    ]
+
+    tables = _read_tables(pages, _service, *bad, _table_item(title="Kept"))
+
+    assert [t.title for t in tables] == ["Kept"]
+
+
+def test_tables_with_no_text_or_on_unknown_pages_produce_no_card() -> None:
+    blank = ExtractedTable.from_rows(1, [["", " "], ["", ""]])
+    elsewhere = ExtractedTable.from_rows(9, [["a", "b"]])
+
+    assert build_table_layouts(DocumentExtraction(tables=[blank, elsewhere]), {1: 1}) == {}
+
+
+def test_each_page_numbers_its_own_tables_and_titles_default_sensibly() -> None:
     extraction = DocumentExtraction(
         tables=[
-            ExtractedTable(page=1, title="Subjects Enrolled", box=[100, 400, 900, 800], rows=[["Code", "Title"], ["IT101", "Intro"], ["", ""]]),
-            ExtractedTable(page=1, rows=[["only", "one", "row"]]),
-            ExtractedTable(page=9, rows=[["off", "document"]]),
+            ExtractedTable.from_rows(1, [["a", "b"]], title="Named"),
+            ExtractedTable.from_rows(1, [["c", "d"]]),
+            ExtractedTable.from_rows(2, [["e", "f"]]),
         ]
     )
 
-    layouts = build_table_layouts(extraction, {1: 101})
+    layouts = build_table_layouts(extraction, {1: 11, 2: 12})
 
-    assert list(layouts) == [1]
-    first, second = layouts[1]
-    assert first["id"] == "page-1-table-1" and first["page_id"] == 101 and first["page_number"] == 1
-    assert first["title"] == "Subjects Enrolled"
-    assert first["bbox"] == [100, 400, 900, 800]
-    assert len(first["rows"]) == 2  # the empty row is dropped
-    assert first["columns"] == [500.0, 500.0]
-    cell = first["rows"][1]["cells"][1]
-    assert (cell["text"], cell["row_index"], cell["column_index"], cell["is_header"]) == ("Intro", 1, 1, False)
-    assert cell["bbox"] == [500, 600, 900, 800]
-    assert cell["uncertain"] is True and cell["token_indices"] == []
-    assert first["rows"][0]["cells"][0]["is_header"] is True
-    assert second["title"] == "Table 2" and len(second["columns"]) == 3
+    assert [(t["id"], t["title"], t["page_id"]) for t in layouts[1]] == [("page-1-table-1", "Named", 11), ("page-1-table-2", "Table 2", 11)]
+    assert layouts[2][0]["id"] == "page-2-table-1"
 
 
-def test_tables_without_a_box_have_no_cell_boxes_and_zero_row_height() -> None:
-    extraction = DocumentExtraction(tables=[ExtractedTable(page=1, rows=[["a", "b"], ["c"]])])
+# ---------------------------------------------------------------------------
+# table contents are not repeated as independent text fields
+# ---------------------------------------------------------------------------
 
-    table = build_table_layouts(extraction, {1: 5})[1][0]
+def _grounded(*attributes, tables):
+    texts = " ".join(a.value for a in attributes)
+    return DocumentExtraction(document_type="Syllabus", page_text={1: texts, 2: texts}, attributes=list(attributes), tables=tables)
 
-    assert table["bbox"] == [] and table["bounding_boxes"] == []
-    assert all(row["height"] == 0 for row in table["rows"])
-    assert table["rows"][1]["cells"][1]["text"] == ""  # short rows are padded
-    assert all(cell["bbox"] == [] for row in table["rows"] for cell in row["cells"])
+
+def test_an_attribute_that_sits_inside_a_table_cell_stays_in_the_table() -> None:
+    table = ExtractedTable.from_rows(1, [["Course Code: CSC 106", "SOFTWARE ENGINEERING 1"]], kind="form")
+    extraction = _grounded(
+        ExtractedAttribute("Course Code", "CSC 106", 0.99, 1),
+        ExtractedAttribute("Descriptive Title", "Software Engineering 1", 0.99, 1),
+        ExtractedAttribute("Prepared By", "Department Chair", 0.99, 1),
+        tables=[table],
+    )
+
+    labels = [p["entity_type_label"] for p in build_attribute_payloads(extraction, {1: 1, 2: 2}, 1)]
+
+    assert labels == ["Prepared By"]
+
+
+def test_short_values_other_pages_and_regions_outside_the_table_are_kept() -> None:
+    table = ExtractedTable.from_rows(1, [["Total units: 3", "Course Code: CSC 106"]], kind="form", box=[100, 100, 900, 300])
+    extraction = _grounded(
+        ExtractedAttribute("Units", "3", 0.99, 1),  # too short to match safely
+        ExtractedAttribute("Course Code", "CSC 106", 0.99, 2),  # same text, but a different page
+        ExtractedAttribute("Reference", "CSC 106", 0.99, 1, box=[100, 600, 300, 700]),  # located below the table
+        ExtractedAttribute("Inside", "CSC 106", 0.99, 1, box=[150, 150, 400, 250]),  # located inside the table
+        tables=[table],
+    )
+
+    labels = [p["entity_type_label"] for p in build_attribute_payloads(extraction, {1: 1, 2: 2}, 1)]
+
+    assert labels == ["Units", "Course Code", "Reference"]
+
+
+def test_without_tables_attributes_are_unaffected() -> None:
+    extraction = _grounded(ExtractedAttribute("Course Code", "CSC 106", 0.99, 1), tables=[])
+
+    assert len(build_attribute_payloads(extraction, {1: 1, 2: 2}, 1)) == 1
