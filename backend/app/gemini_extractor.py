@@ -129,6 +129,10 @@ class _TruncatedResponse(Exception):
     """Internal: Gemini stopped because it ran out of output tokens."""
 
 
+class _InvalidResponse(Exception):
+    """Internal: the reply could not be parsed as JSON (usually a very long answer that was cut off or garbled)."""
+
+
 class _RecitationStop(Exception):
     """Internal: Gemini stopped because its output resembled memorized text (finishReason RECITATION)."""
 
@@ -510,6 +514,25 @@ def _parse_payload(data: Any) -> DocumentExtraction:
     return result
 
 
+def _loads_lenient(text: str) -> Any:
+    """Parse the model's JSON, tolerating a markdown fence or stray text around the object.
+
+    Raises ``ValueError`` (with a position, never the text itself) when no JSON object can be read.
+    """
+    stripped = text.strip()
+    try:
+        return json.loads(stripped)
+    except ValueError as first_error:
+        start = stripped.find("{")
+        if start >= 0:
+            try:
+                value, _ = json.JSONDecoder().raw_decode(stripped[start:])
+                return value
+            except ValueError:
+                pass
+        raise first_error
+
+
 def _retry_after_seconds(response: Any) -> Optional[float]:
     headers = getattr(response, "headers", None)
     if not headers:
@@ -669,14 +692,17 @@ class GeminiExtractionService:
             # Smaller requests mean shorter answers, which fail less often when the service is struggling.
             logger.info("Gemini kept returning a server error; splitting %d pages into two requests", len(chunk))
             return self._split_and_extract(chunk, api_key, known_document_type, should_cancel, mode)
-        except _RecitationStop:
+        except (_RecitationStop, _InvalidResponse) as stop:
+            reason = "stopped with RECITATION" if isinstance(stop, _RecitationStop) else "returned an unreadable answer"
             if len(chunk) > 1:
-                # Narrow down which page trips the filter; the other pages keep their full transcription.
-                logger.info("Gemini stopped with RECITATION; splitting %d pages into two requests", len(chunk))
+                # Narrow down which page is the problem; the other pages keep their full transcription. A
+                # shorter request also means a shorter answer, which is less likely to come back garbled.
+                logger.info("Gemini %s; splitting %d pages into two requests", reason, len(chunk))
                 return self._split_and_extract(chunk, api_key, known_document_type, should_cancel, mode)
             if mode < MODE_ATTRIBUTES_ONLY:
                 logger.info(
-                    "Gemini stopped with RECITATION on page %d; retrying with less verbatim text (mode %d)",
+                    "Gemini %s on page %d; retrying with less verbatim text (mode %d)",
+                    reason,
                     chunk[0].number,
                     mode + 1,
                 )
@@ -685,6 +711,10 @@ class GeminiExtractionService:
                 if self.request_delay_seconds > 0:
                     self._sleep(self.request_delay_seconds)
                 return self._extract_chunk(chunk, api_key, known_document_type, should_cancel, mode + 1)
+            if isinstance(stop, _InvalidResponse):
+                raise GeminiExtractionError(
+                    f"Gemini response was not valid JSON (page {chunk[0].number}, even with a shorter request)"
+                ) from None
             raise GeminiExtractionError(
                 f"Gemini would not read page {chunk[0].number} (RECITATION): the page repeats text it declines to reproduce"
             ) from None
@@ -799,9 +829,11 @@ class GeminiExtractionService:
         try:
             body = response.json()
         except Exception:
-            raise GeminiExtractionError("Gemini response was not valid JSON") from None
+            logger.warning("Gemini returned an HTTP body that is not JSON")
+            raise _InvalidResponse() from None
         if not isinstance(body, dict):
-            raise GeminiExtractionError("Gemini response was not valid JSON")
+            logger.warning("Gemini returned an HTTP body that is not a JSON object")
+            raise _InvalidResponse()
 
         feedback = body.get("promptFeedback")
         block_reason = feedback.get("blockReason") if isinstance(feedback, dict) else None
@@ -833,9 +865,16 @@ class GeminiExtractionService:
         if not text.strip():
             raise GeminiExtractionError("Gemini returned no content")
         try:
-            data = json.loads(text)
-        except ValueError:
-            raise GeminiExtractionError("Gemini response was not valid JSON") from None
+            data = _loads_lenient(text)
+        except ValueError as exc:
+            # Only the parser's message (a position) is logged, never the model's text.
+            logger.warning(
+                "Gemini returned %d characters that are not valid JSON (finish reason %s): %s",
+                len(text),
+                finish_reason,
+                exc,
+            )
+            raise _InvalidResponse() from None
         return _parse_payload(data)
 
 

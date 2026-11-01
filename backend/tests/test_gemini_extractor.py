@@ -569,6 +569,76 @@ def test_unfinished_candidates_fail(pages, reason) -> None:
         service.extract_document(pages(1))
 
 
+def test_json_wrapped_in_a_markdown_fence_or_stray_text_is_still_read(pages) -> None:
+    body = json.dumps(_payload())
+    for wrapped in (f"```json\n{body}\n```", f"Here is the result:\n{body}\nHope that helps.", f"  {body}  "):
+        service, _ = _service(FakeTransport(_response(raw_text=wrapped)))
+        assert service.extract_document(pages(1)).attributes[0].label == "Student Name"
+
+
+def test_a_cut_off_answer_on_a_multi_page_request_splits_it(pages) -> None:
+    truncated = json.dumps(_payload(pages=[{"page": 1, "text": "a"}]))[:-9]  # ends in the middle of the object
+    transport = FakeTransport(
+        _response(raw_text=truncated),
+        _response(_payload("Syllabus", [{"page": 1, "text": "a"}], [_attribute("A", "1", page=1)])),
+        _response(_payload("Syllabus", [{"page": 2, "text": "b"}, {"page": 3, "text": "c"}], [_attribute("B", "2", page=3)])),
+    )
+    service, _ = _service(transport)
+
+    result = service.extract_document(pages(3))
+
+    assert [_page_labels(call) for call in transport.calls] == [["Page 1", "Page 2", "Page 3"], ["Page 1"], ["Page 2", "Page 3"]]
+    assert all("do NOT transcribe" not in _system_prompt(call) for call in transport.calls)  # halves keep the full answer
+    assert [a.label for a in result.attributes] == ["A", "B"]
+    assert sorted(result.page_text) == [1, 2, 3]
+
+
+def test_an_unreadable_answer_on_one_page_retries_with_a_shorter_answer(pages) -> None:
+    transport = FakeTransport(
+        _response(raw_text="{\"document_type\": \"x\", \"pages\": [{\"page\": 1, \"text\": \"cut"),
+        _response(raw_text="{\"document_type\": "),
+        _response(_payload("Syllabus", [{"page": 1, "text": ""}], [_attribute("Course Code", "CSC 106")])),
+    )
+    service, _ = _service(transport)
+
+    result = service.extract_document(pages(1))
+
+    prompts = [_system_prompt(call) for call in transport.calls]
+    assert "do NOT transcribe" not in prompts[0]
+    assert "do NOT transcribe" in prompts[1] and "any tables" in prompts[1] and "do not return any tables" not in prompts[1]
+    assert "do not return any tables" in prompts[2]
+    assert [a.label for a in result.attributes] == ["Course Code"]
+    assert result.untranscribed_pages == [1]
+
+
+def test_a_page_that_never_yields_readable_json_fails_naming_the_page(pages, caplog) -> None:
+    transport = FakeTransport(_response(raw_text=f"{RESPONSE_BODY_MARKER} {{ not json"))
+    service, _ = _service(transport)
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(GeminiExtractionError, match=r"not valid JSON \(page 1") as excinfo:
+            service.extract_document(pages(1))
+
+    assert len(transport.calls) == 3  # full answer, no transcription, attributes only
+    assert RESPONSE_BODY_MARKER not in str(excinfo.value)
+    assert RESPONSE_BODY_MARKER not in caplog.text  # only the parser's position is logged
+    assert "not valid JSON (finish reason" in caplog.text
+
+
+def test_an_http_body_that_is_not_json_is_handled_the_same_way(pages) -> None:
+    def broken():
+        raise ValueError("no json here")
+
+    response = SimpleNamespace(status_code=200, json=broken, headers={})
+    transport = FakeTransport(response)
+    service, _ = _service(transport)
+
+    with pytest.raises(GeminiExtractionError, match="not valid JSON"):
+        service.extract_document(pages(1))
+
+    assert len(transport.calls) == 3
+
+
 def test_malformed_json_fails_without_echoing_the_text(pages) -> None:
     service, _ = _service(FakeTransport(_response(raw_text=f"{RESPONSE_BODY_MARKER} {{not json")))
     with pytest.raises(GeminiExtractionError, match="not valid JSON") as excinfo:
