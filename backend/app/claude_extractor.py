@@ -50,6 +50,8 @@ DEFAULT_MAX_OUTPUT_TOKENS = 16000
 DEFAULT_MAX_REQUEST_BYTES = 25_000_000
 DEFAULT_MAX_RETRIES = 5
 MAX_RETRY_AFTER_SECONDS = 60.0
+# After the first 429 in a document, leave this long between requests so the rest do not hit the limit again.
+RATE_LIMIT_SPACING_SECONDS = 10.0
 
 # Image limits from the Claude vision docs: one visual token per 28x28 px patch, and models from
 # Claude 4.7 on take up to 4784 tokens (long edge 2576) before the API resizes the image. Staying
@@ -658,6 +660,8 @@ class ClaudeExtractionService:
             else os.getenv("CLAUDE_REQUEST_BOXES", "").strip().lower() in _TRUE_VALUES
         )
         self.max_retries = _env_int("CLAUDE_MAX_RETRIES", DEFAULT_MAX_RETRIES, minimum=0)
+        self._spacing = 0.0  # extra pause before each request once a rate limit has been hit
+        self._requests_sent = 0
         self.max_output_tokens = _env_int("CLAUDE_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS, minimum=1024)
         self.max_request_bytes = _env_int("CLAUDE_MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES, minimum=1_000_000)
 
@@ -828,6 +832,9 @@ class ClaudeExtractionService:
         }
         retries = 0
         transport_retried = False
+        if self._spacing > 0 and self._requests_sent > 0:
+            self._sleep(self._spacing)
+        self._requests_sent += 1
         while True:
             try:
                 response = self._post(CLAUDE_ENDPOINT, headers, payload, self.timeout_seconds)
@@ -846,6 +853,8 @@ class ClaudeExtractionService:
             retryable = status == 429 or (isinstance(status, int) and status >= 500)
             if retryable and retries < self.max_retries:
                 delay = _retry_after_seconds(response)
+                if status == 429:
+                    self._spacing = max(self._spacing, RATE_LIMIT_SPACING_SECONDS)
                 self._sleep(delay if delay is not None else self._backoff(retries))
                 retries += 1
                 continue

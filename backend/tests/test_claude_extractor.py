@@ -569,6 +569,25 @@ def test_rate_limit_that_never_clears_reports_it(pages) -> None:
         service.extract_document(pages(1))
 
 
+def test_after_a_rate_limit_later_requests_are_spaced_out(pages) -> None:
+    transport = FakeTransport(_response(status=429, headers={"retry-after": "7"}), _response(_payload(attributes=[])))
+    service, sleeps = _service(transport, pages_per_request=1)
+
+    service.extract_document(pages(2))
+
+    assert len(transport.calls) == 3  # page 1 (limited), page 1 again, page 2
+    assert sleeps == [7.0, 10.0]  # the API's own wait, then a pause before the next request
+
+
+def test_overload_errors_do_not_trigger_request_spacing(pages) -> None:
+    transport = FakeTransport(_response(status=529), _response(_payload(attributes=[])))
+    service, sleeps = _service(transport, pages_per_request=1)
+
+    service.extract_document(pages(2))
+
+    assert sleeps == [2.0]  # backoff only; the second page follows immediately
+
+
 def test_transport_error_is_retried_once_then_reports_type_only(pages) -> None:
     class ReadTimeout(Exception):
         pass
