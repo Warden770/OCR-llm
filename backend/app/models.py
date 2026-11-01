@@ -30,6 +30,7 @@ class Document(Base):
     processing_duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="PENDING")
     extracted_attributes: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    processing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     pages: Mapped[List["Page"]] = relationship(back_populates="document", cascade="all, delete-orphan")
     attributes: Mapped[List["Attribute"]] = relationship(
@@ -48,6 +49,8 @@ class Page(Base):
     page_number: Mapped[int] = mapped_column(Integer, nullable=False)
     image_path: Mapped[str] = mapped_column(String(512), nullable=False)
     storage_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    ocr_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ocr_layout: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True, default=list)
 
     document: Mapped[Document] = relationship(back_populates="pages")
     attributes: Mapped[List["Attribute"]] = relationship(

@@ -88,6 +88,7 @@ def _ensure_review_columns() -> None:
             "processing_started_at": "DATETIME",
             "processing_finished_at": "DATETIME",
             "processing_duration_seconds": "FLOAT",
+            "processing_error": "TEXT",
         }
         for column_name, column_type in document_compatibility_columns.items():
             if column_name not in document_columns:
@@ -101,6 +102,11 @@ def _ensure_review_columns() -> None:
             logger.warning("Applying compatibility migration: adding pages.storage_key column")
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE pages ADD COLUMN storage_key VARCHAR(512)"))
+        for column_name, column_type in {"ocr_text": "TEXT", "ocr_layout": "JSON DEFAULT '[]'"}.items():
+            if column_name not in page_columns:
+                logger.warning("Applying compatibility migration: adding pages.%s column", column_name)
+                with engine.begin() as connection:
+                    connection.execute(text(f"ALTER TABLE pages ADD COLUMN {column_name} {column_type}"))
 
     if "attributes" in table_names:
         attribute_columns = {column["name"] for column in inspector.get_columns("attributes")}

@@ -13,6 +13,13 @@ from sqlalchemy.pool import StaticPool
 
 from app import ingestion_pipeline
 from app.db import get_db
+from app.gemini_extractor import (
+    DocumentExtraction,
+    ExtractedAttribute,
+    ExtractedTable,
+    ExtractionCanceled,
+    GeminiExtractionError,
+)
 from app.main import app
 from app.models import Attribute, Base, Correction, Document, Page
 
@@ -35,6 +42,38 @@ def _override_get_db(session: Session) -> Callable[[], Generator[Session, None, 
             pass
 
     return _dependency
+
+
+def _use_fake_gemini(
+    monkeypatch: pytest.MonkeyPatch,
+    extraction: DocumentExtraction | None = None,
+    error: BaseException | None = None,
+    calls: list[Any] | None = None,
+) -> None:
+    """Replace the Gemini service so tests never touch the network or need real page images."""
+
+    class FakeGeminiService:
+        def extract_document(self, pages: list[tuple[int, Path]], should_cancel: Callable[[], bool] | None = None) -> DocumentExtraction:
+            if calls is not None:
+                calls.append(list(pages))
+            if error is not None:
+                raise error
+            return extraction if extraction is not None else DocumentExtraction()
+
+    monkeypatch.setattr(ingestion_pipeline, "GeminiExtractionService", FakeGeminiService)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+
+def _seed_document(factory: sessionmaker[Session], **fields: Any) -> int:
+    session = factory()
+    values: dict[str, Any] = {"name": "doc.pdf", "format": "pdf", "owner_id": "local-development-user", "page_count": 0, "status": "QUEUED"}
+    values.update(fields)
+    document = Document(**values)
+    session.add(document)
+    session.commit()
+    document_id = document.id
+    session.close()
+    return document_id
 
 
 def test_document_status_endpoint_validates_transitions_and_prerequisites() -> None:
@@ -99,31 +138,22 @@ def test_processing_stages_attributes_without_persisting(
     rasterized_page.write_bytes(b"fake-png")
 
     monkeypatch.setattr(ingestion_pipeline, "SessionLocal", factory)
+
     def fake_rasterize(path: Path, doc_id: str) -> list[Path]:
         return [rasterized_page]
 
-    def fake_detect_document_type(page_paths: list[Path], original_name: str) -> dict[str, str]:
-        return {"document_type": "invoice"}
-
-    def fake_attribute_payloads(
-        page_id: int,
-        doc_id: int,
-        image_path: Path,
-        document_type: str | None = None,
-    ) -> list[dict[str, Any]]:
-        return [
-            {
-                "entity_type_label": "TOTAL",
-                "extracted_value": "123.45",
-                "bounding_boxes": [[1, 1, 2, 2]],
-                "confidence_score": 0.91,
-                "validation_status": "APPROVED",
-            }
-        ]
-
+    gemini_calls: list[Any] = []
+    _use_fake_gemini(
+        monkeypatch,
+        DocumentExtraction(
+            document_type="Sales Invoice",
+            page_text={1: "Total Amount 123.45"},
+            attributes=[ExtractedAttribute("Total Amount", "123.45", 0.91, 1, box=[10, 20, 30, 40])],
+            tables=[ExtractedTable.from_rows(1, [["Item", "Price"], ["Pen", "123.45"]], title="Items", box=[0, 100, 500, 300])],
+        ),
+        calls=gemini_calls,
+    )
     monkeypatch.setattr(ingestion_pipeline, "_rasterize_pdf", fake_rasterize)
-    monkeypatch.setattr(ingestion_pipeline, "_detect_document_type", fake_detect_document_type)
-    monkeypatch.setattr(ingestion_pipeline, "_build_attribute_payloads_for_page", fake_attribute_payloads)
 
     result = ingestion_pipeline.process_document_job(document_id, str(source_path), "sample.pdf", "local-development-user")
     assert result["status"] == "processed"
@@ -140,9 +170,24 @@ def test_processing_stages_attributes_without_persisting(
         assert refreshed_document.processing_finished_at is not None
         assert refreshed_document.processing_duration_seconds is not None
         assert refreshed_document.processing_duration_seconds >= 0
+        assert refreshed_document.document_type == "sales_invoice"
+        assert refreshed_document.processing_error is None
         assert refreshed_document.extracted_attributes
-        assert refreshed_document.extracted_attributes[0]["entity_type_label"] == "TOTAL"
-        assert refreshed_document.extracted_attributes[0]["saved"] is False
+        staged = refreshed_document.extracted_attributes[0]
+        assert staged["entity_type_label"] == "Total Amount"
+        assert staged["extracted_value"] == "123.45"
+        assert staged["bounding_boxes"] == [[10, 20, 30, 40]]
+        assert staged["page_number"] == 1
+        assert staged["validation_status"] == "APPROVED"
+        assert staged["saved"] is False
+        assert staged["continues_from_previous_page"] is False
+
+        page = verify_session.query(Page).filter(Page.document_id == document_id).one()
+        assert page.ocr_text == "Total Amount 123.45"
+        assert page.ocr_layout[0]["title"] == "Items"
+        assert page.ocr_layout[0]["page_id"] == page.id
+        assert staged["page_id"] == page.id
+        assert gemini_calls == [[(1, rasterized_page)]]
     finally:
         verify_session.close()
 
@@ -171,17 +216,6 @@ def test_processing_worker_downloads_source_storage_key(
         assert path.read_bytes() == b"downloaded-pdf"
         return [rasterized_page]
 
-    def fake_detect_document_type(page_paths: list[Path], original_name: str) -> dict[str, str]:
-        return {"document_type": "invoice"}
-
-    def no_attribute_payloads(
-        page_id: int,
-        doc_id: int,
-        image_path: Path,
-        document_type: str | None = None,
-    ) -> list[dict[str, Any]]:
-        return []
-
     def storage_is_enabled() -> bool:
         return True
 
@@ -192,9 +226,8 @@ def test_processing_worker_downloads_source_storage_key(
     monkeypatch.setattr(ingestion_pipeline, "storage_enabled", storage_is_enabled)
     monkeypatch.setattr(ingestion_pipeline, "download_file", fake_download)
     monkeypatch.setattr(ingestion_pipeline, "_rasterize_pdf", fake_rasterize)
-    monkeypatch.setattr(ingestion_pipeline, "_detect_document_type", fake_detect_document_type)
-    monkeypatch.setattr(ingestion_pipeline, "_build_attribute_payloads_for_page", no_attribute_payloads)
     monkeypatch.setattr(ingestion_pipeline, "upload_file", ignore_upload)
+    _use_fake_gemini(monkeypatch)
 
     result = ingestion_pipeline.process_document_job(
         document_id,
@@ -242,24 +275,12 @@ def test_reprocessing_failure_preserves_previous_success(
     def fake_rasterize(path: Path, artifact_id: str) -> list[Path]:
         return [new_page_path]
 
-    def fake_detect_document_type(page_paths: list[Path], original_name: str) -> dict[str, str]:
-        return {"document_type": "invoice"}
-
     def ignore_upload(path: Path, object_key: str) -> None:
         return None
 
-    def fail_attribute_payloads(
-        page_id: int,
-        doc_id: int,
-        image_path: Path,
-        document_type: str | None = None,
-    ) -> list[dict[str, Any]]:
-        raise RuntimeError("model failed")
-
     monkeypatch.setattr(ingestion_pipeline, "_rasterize_pdf", fake_rasterize)
-    monkeypatch.setattr(ingestion_pipeline, "_detect_document_type", fake_detect_document_type)
     monkeypatch.setattr(ingestion_pipeline, "upload_file", ignore_upload)
-    monkeypatch.setattr(ingestion_pipeline, "_build_attribute_payloads_for_page", fail_attribute_payloads)
+    _use_fake_gemini(monkeypatch, error=RuntimeError("model failed"))
 
     with pytest.raises(RuntimeError, match="model failed"):
         ingestion_pipeline.process_document_job(document_id, str(source_path), "reprocess.pdf", "local-development-user")
@@ -270,7 +291,9 @@ def test_reprocessing_failure_preserves_previous_success(
         assert refreshed is not None
         assert refreshed.status == "PROCESSED"
         assert refreshed.page_count == 1
+        assert refreshed.processing_error is None
         assert verify_session.get(Page, old_page_id) is not None
+        assert verify_session.query(Page).filter(Page.document_id == document_id).count() == 1
         assert old_page_path.read_bytes() == b"old-page"
         assert not new_page_path.exists()
     finally:
@@ -755,3 +778,270 @@ def test_save_selected_returns_attribute_details() -> None:
     finally:
         app.dependency_overrides.clear()
         session.close()
+
+
+def test_gemini_failure_marks_document_failed_with_a_readable_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = _build_session_factory()
+    document_id = _seed_document(factory)
+    source_path = tmp_path / "doc.pdf"
+    source_path.write_bytes(b"%PDF-1.4\n%%EOF")
+    page = tmp_path / "page-1.png"
+    page.write_bytes(b"fake-png")
+
+    monkeypatch.setattr(ingestion_pipeline, "SessionLocal", factory)
+    monkeypatch.setattr(ingestion_pipeline, "_rasterize_pdf", lambda path, artifact_id: [page])
+    _use_fake_gemini(monkeypatch, error=GeminiExtractionError("Gemini API returned HTTP 401 (check GEMINI_API_KEY)"))
+
+    with pytest.raises(GeminiExtractionError):
+        ingestion_pipeline.process_document_job(document_id, str(source_path), "doc.pdf", "local-development-user")
+
+    verify_session = factory()
+    try:
+        document = verify_session.get(Document, document_id)
+        assert document is not None
+        assert document.status == "FAILED"
+        assert document.processing_error == "Gemini API returned HTTP 401 (check GEMINI_API_KEY)"
+        assert document.processing_finished_at is not None
+        assert verify_session.query(Page).filter(Page.document_id == document_id).count() == 0
+        assert not page.exists()
+    finally:
+        verify_session.close()
+
+    app.dependency_overrides[get_db] = _override_get_db(factory())
+    try:
+        body = TestClient(app).get(f"/api/v1/documents/{document_id}").json()
+        assert body["status"] == "FAILED"
+        assert body["processing_error"] == "Gemini API returned HTTP 401 (check GEMINI_API_KEY)"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_unexpected_errors_get_a_generic_reason_without_details(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = _build_session_factory()
+    document_id = _seed_document(factory)
+    source_path = tmp_path / "doc.pdf"
+    source_path.write_bytes(b"%PDF-1.4\n%%EOF")
+    page = tmp_path / "page-1.png"
+    page.write_bytes(b"fake-png")
+
+    monkeypatch.setattr(ingestion_pipeline, "SessionLocal", factory)
+    monkeypatch.setattr(ingestion_pipeline, "_rasterize_pdf", lambda path, artifact_id: [page])
+    _use_fake_gemini(monkeypatch, error=ValueError("secret request detail"))
+
+    with pytest.raises(ValueError):
+        ingestion_pipeline.process_document_job(document_id, str(source_path), "doc.pdf", "local-development-user")
+
+    verify_session = factory()
+    try:
+        document = verify_session.get(Document, document_id)
+        assert document is not None and document.status == "FAILED"
+        assert document.processing_error == "Processing failed (ValueError)"
+    finally:
+        verify_session.close()
+
+
+def test_missing_api_key_fails_the_document_before_rasterizing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = _build_session_factory()
+    document_id = _seed_document(factory)
+    source_path = tmp_path / "doc.pdf"
+    source_path.write_bytes(b"%PDF-1.4\n%%EOF")
+    rasterize_calls: list[Path] = []
+
+    def rasterize(path: Path, artifact_id: str) -> list[Path]:
+        rasterize_calls.append(path)
+        return []
+
+    monkeypatch.setattr(ingestion_pipeline, "SessionLocal", factory)
+    monkeypatch.setattr(ingestion_pipeline, "_rasterize_pdf", rasterize)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    with pytest.raises(GeminiExtractionError, match="GEMINI_API_KEY is not set"):
+        ingestion_pipeline.process_document_job(document_id, str(source_path), "doc.pdf", "local-development-user")
+
+    verify_session = factory()
+    try:
+        document = verify_session.get(Document, document_id)
+        assert document is not None
+        assert document.status == "FAILED"
+        assert document.processing_error == "GEMINI_API_KEY is not set"
+        assert rasterize_calls == []
+    finally:
+        verify_session.close()
+
+
+def test_a_successful_retry_clears_the_previous_failure_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = _build_session_factory()
+    document_id = _seed_document(factory, processing_error="Gemini API returned HTTP 429 (rate limit or quota exceeded)")
+    source_path = tmp_path / "doc.pdf"
+    source_path.write_bytes(b"%PDF-1.4\n%%EOF")
+    page = tmp_path / "page-1.png"
+    page.write_bytes(b"fake-png")
+
+    monkeypatch.setattr(ingestion_pipeline, "SessionLocal", factory)
+    monkeypatch.setattr(ingestion_pipeline, "_rasterize_pdf", lambda path, artifact_id: [page])
+    _use_fake_gemini(monkeypatch, DocumentExtraction(page_text={1: "blank"}))
+
+    ingestion_pipeline.process_document_job(document_id, str(source_path), "doc.pdf", "local-development-user")
+
+    verify_session = factory()
+    try:
+        document = verify_session.get(Document, document_id)
+        assert document is not None
+        assert document.status == "PROCESSED"
+        assert document.processing_error is None
+        assert document.document_type == "unknown"
+        assert document.extracted_attributes == []  # a page with nothing to extract is not an error
+    finally:
+        verify_session.close()
+
+
+def test_cancel_during_extraction_stops_without_writing_pages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory = _build_session_factory()
+    document_id = _seed_document(factory)
+    source_path = tmp_path / "doc.pdf"
+    source_path.write_bytes(b"%PDF-1.4\n%%EOF")
+    page = tmp_path / "page-1.png"
+    page.write_bytes(b"fake-png")
+
+    class CancelingService:
+        def extract_document(self, pages: list[tuple[int, Path]], should_cancel: Callable[[], bool] | None = None) -> DocumentExtraction:
+            other_session = factory()
+            other = other_session.get(Document, document_id)
+            assert other is not None
+            other.status = "CANCELED"
+            other_session.commit()
+            other_session.close()
+            assert should_cancel is not None and should_cancel() is True
+            raise ExtractionCanceled()
+
+    monkeypatch.setattr(ingestion_pipeline, "SessionLocal", factory)
+    monkeypatch.setattr(ingestion_pipeline, "_rasterize_pdf", lambda path, artifact_id: [page])
+    monkeypatch.setattr(ingestion_pipeline, "GeminiExtractionService", CancelingService)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    result = ingestion_pipeline.process_document_job(document_id, str(source_path), "doc.pdf", "local-development-user")
+
+    assert result["status"] == "canceled"
+    verify_session = factory()
+    try:
+        document = verify_session.get(Document, document_id)
+        assert document is not None and document.status == "CANCELED"
+        assert verify_session.query(Page).filter(Page.document_id == document_id).count() == 0
+        assert not page.exists()
+    finally:
+        verify_session.close()
+
+
+def test_ocr_endpoint_returns_stored_data_without_running_any_ocr(tmp_path: Path) -> None:
+    from PIL import Image
+
+    image_path = tmp_path / "page-1.png"
+    Image.new("RGB", (300, 200), "white").save(image_path)
+    table = {"id": "page-1-table-1", "page_number": 1, "title": "Items", "rows": [], "columns": []}
+
+    factory = _build_session_factory()
+    session = factory()
+    document = Document(
+        name="stored.pdf",
+        format="pdf",
+        owner_id="local-development-user",
+        page_count=2,
+        status="PROCESSED",
+        document_type="sales_invoice",
+    )
+    session.add(document)
+    session.flush()
+    session.add(Page(document_id=document.id, page_number=1, image_path=str(image_path), ocr_text="Invoice\n\nTotal 5", ocr_layout=[table]))
+    # A page stored before the Gemini migration has no transcription at all.
+    session.add(Page(document_id=document.id, page_number=2, image_path=str(tmp_path / "missing.png")))
+    session.commit()
+    document_id = document.id
+
+    app.dependency_overrides[get_db] = _override_get_db(session)
+    try:
+        response = TestClient(app).get(f"/api/v1/documents/{document_id}/ocr")
+    finally:
+        app.dependency_overrides.clear()
+        session.close()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["document_id"] == document_id and body["document_type"] == "sales_invoice"
+    first, second = body["pages"]
+    assert first["page_number"] == 1
+    assert first["text"] == "Invoice\n\nTotal 5"
+    assert [line["text"] for line in first["lines"]] == ["Invoice", "Total 5"]
+    assert all(line["tokens"] == [] for line in first["lines"])
+    assert first["tokens"] == []
+    assert (first["page_width"], first["page_height"]) == (300, 200)
+    assert first["tables"] == [table]
+    assert first["image_url"] == f"/api/v1/documents/{document_id}/pages/1/image"
+    assert {"page_id", "lines", "tokens", "page_width", "page_height", "tables"} <= set(first)
+    assert second["text"] == "" and second["lines"] == [] and second["tables"] == []
+    assert second["page_width"] is None
+    assert not hasattr(ingestion_pipeline, "extract_tokens_with_bboxes")  # nothing here can run OCR
+
+
+def _staged(label: str, value: str, page: int, **extra: Any) -> dict[str, Any]:
+    return {
+        "entity_type_label": label,
+        "extracted_value": value,
+        "original_prediction": value,
+        "page_number": page,
+        "page_id": page,
+        "bounding_boxes": [[0, 0, 10, 10]],
+        "page_spans": [{"page_id": page, "page_number": page, "text": value, "bounding_boxes": [[0, 0, 10, 10]]}],
+        "confidence_score": 0.9,
+        "validation_status": "APPROVED",
+        **extra,
+    }
+
+
+def test_same_label_on_adjacent_pages_is_not_merged_without_the_continuation_flag() -> None:
+    merged = ingestion_pipeline._merge_staged_attributes(
+        [_staged("Total", "10", 1), _staged("Total", "20", 2), _staged("Total", "30", 3, continues_from_previous_page=False)]
+    )
+
+    assert [item["extracted_value"] for item in merged] == ["10", "20", "30"]
+
+
+def test_flagged_continuations_merge_across_several_pages() -> None:
+    merged = ingestion_pipeline._merge_staged_attributes(
+        [
+            _staged("Notes", "first part", 1),
+            _staged("Total", "99", 1),
+            _staged("Notes", "second part", 2, continues_from_previous_page=True, confidence_score=0.6),
+            _staged("Notes", "third part", 3, continues_from_previous_page=True),
+        ]
+    )
+
+    assert [item["entity_type_label"] for item in merged] == ["Notes", "Total"]
+    notes = merged[0]
+    assert notes["extracted_value"] == "first part\n\nsecond part\n\nthird part"
+    assert notes["original_prediction"] == notes["extracted_value"]
+    assert [span["page_number"] for span in notes["page_spans"]] == [1, 2, 3]
+    assert len(notes["bounding_boxes"]) == 3
+    assert notes["confidence_score"] == 0.6 and notes["validation_status"] == "HITL"
+
+
+def test_a_continuation_flag_without_a_matching_previous_page_value_stays_separate() -> None:
+    merged = ingestion_pipeline._merge_staged_attributes(
+        [_staged("Notes", "page one", 1), _staged("Notes", "page three", 3, continues_from_previous_page=True)]
+    )
+
+    assert len(merged) == 2

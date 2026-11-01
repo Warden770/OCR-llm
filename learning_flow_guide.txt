@@ -1,30 +1,22 @@
-OCR DOCUMENT FLOW (LLM-BASED)
+DOCUMENT FLOW (GEMINI-ONLY)
 
-There is no model training. A multimodal LLM reads each page and extracts the fields defined for its
-document type. Ground truth is used only to measure accuracy.
+There is no model training and no predefined field list. Gemini reads each page image and decides what
+the document is and which attributes it contains.
 
 1. Upload documents.
    - Pages are rasterized to images and saved under datasets/raw-pages/<document_id>/.
 
-2. OCR and classification.
-   - Tesseract produces tokens and bounding boxes.
-   - The document type is classified, which selects the field list in document_schemas.py.
-
-3. LLM extraction.
-   - backend/app/llm_extractor.py sends the page image and the numbered OCR tokens to Claude.
-   - Claude returns each field with the OCR token indices it came from and a confidence.
+2. Gemini reads the pages.
+   - backend/app/gemini_extractor.py sends the page images (up to GEMINI_PAGES_PER_REQUEST per request).
+   - Gemini returns the document type, a transcription of each page, the attributes it found with a
+     confidence, page number and approximate region, and any tables.
+   - Values that do not appear in their page's transcription are capped at confidence 0.5.
    - Confidence >= 0.75 is pre-approved; the rest goes to human review.
-   - Without ANTHROPIC_API_KEY (or if the call fails) the system falls back to OCR-only heuristics.
+   - If Gemini fails (bad key, rate limit, timeout, malformed response) the document is marked FAILED with a
+     readable reason, and Retry runs it again. There is no OCR fallback.
 
-4. Human review.
-   - Reviewers approve or correct fields in the dashboard. Corrections are kept for auditing.
-
-5. Measure accuracy (optional, recommended).
-   - Annotate a sample of pages in CVAT to create independent ground truth.
-   - Run: dataset_tools predict, then dataset_tools evaluate.
-   - Adjust the prompt or schemas, then run both again and compare.
-   - Never use the model's own output as ground truth.
+3. Human review.
+   - Reviewers approve or correct attributes in the dashboard. Corrections are kept for auditing.
 
 Simple order:
-Raw documents -> page images -> OCR -> LLM extraction -> human review
-Evaluation loop: annotate sample -> predict -> evaluate -> tweak prompt/schemas -> repeat
+Raw documents -> page images -> Gemini (OCR + type + attributes) -> human review -> saved attributes

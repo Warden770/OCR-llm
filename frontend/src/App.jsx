@@ -673,6 +673,13 @@ function normalizeDocumentAttributes(attributes) {
 function isStructuredTable(table) {
   const rows = Array.isArray(table?.rows) ? table.rows : []
   const columns = Array.isArray(table?.columns) ? table.columns : []
+  if (table?.source === 'gemini' || table?.source === 'claude') {
+    // The model judged this region to be a table from its borders, cell boundaries and layout, so it is not
+    // second-guessed by counting rows or filled cells: form-like tables have few records, merged cells and
+    // long paragraphs, and are still tables.
+    const cellCount = rows.reduce((sum, row) => sum + (row.cells || []).length, 0)
+    return rows.length >= 1 && columns.length >= 1 && cellCount >= 2
+  }
   if (rows.length < 2 || columns.length < 2) {
     return false
   }
@@ -702,28 +709,23 @@ function collectDocumentTables(ocrPages, attributes) {
   )
 }
 
-function boxesOverlap(a, b) {
-  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== 4 || b.length !== 4) {
-    return false
-  }
-
-  const [ax0, ay0, ax1, ay1] = a
-  const [bx0, by0, bx1, by1] = b
-  const overlapWidth = Math.max(0, Math.min(ax1, bx1) - Math.max(ax0, bx0))
-  const overlapHeight = Math.max(0, Math.min(ay1, by1) - Math.max(ay0, by0))
-  return overlapWidth > 0 && overlapHeight > 0
+function isValidBox(box) {
+  return Array.isArray(box) && box.length === 4 && box.every((value) => Number.isFinite(Number(value)))
 }
 
-function buildTokenAttributeIndex(attributes, pages) {
-  const tokenToAttribute = new Map()
-  const attributeToTokens = new Map()
+// Gemini returns one approximate region per attribute (no word tokens), so the page viewer draws
+// each attribute's own boxes. Attributes without boxes stay selectable from the side panel.
+function buildAttributeBoxIndex(attributes, pages) {
+  const boxToAttribute = new Map()
+  const attributeToBoxes = new Map()
+  const boxesByPage = new Map()
 
   for (const attribute of attributes || []) {
     const attributeKey = attribute.id ?? attribute.temp_id
     if (attributeKey == null) {
       continue
     }
-    const tokenKeys = []
+    const boxKeys = []
 
     for (const page of pages || []) {
       const pageSpan = (attribute.page_spans || []).find((span) => Number(span.page_number) === Number(page.page_number))
@@ -732,23 +734,31 @@ function buildTokenAttributeIndex(attributes, pages) {
         : (Number(attribute.page_number) === Number(page.page_number) || !attribute.page_number
           ? (Array.isArray(attribute.bounding_boxes) ? attribute.bounding_boxes : [])
           : [])
-      for (const line of page.lines || []) {
-        for (const token of line.tokens || []) {
-          const tokenKey = `${page.page_number}:${token.token_index}`
-          const tokenBox = token.bbox
-          const matches = boxes.some((box) => boxesOverlap(box, tokenBox))
-          if (matches) {
-            tokenToAttribute.set(tokenKey, attributeKey)
-            tokenKeys.push(tokenKey)
-          }
+      boxes.forEach((box, index) => {
+        if (!isValidBox(box)) {
+          return
         }
-      }
+        const boxKey = `${page.page_number}:${attributeKey}:${index}`
+        boxToAttribute.set(boxKey, attributeKey)
+        boxKeys.push(boxKey)
+        const entry = {
+          key: boxKey,
+          attributeKey,
+          box: box.map(Number),
+          score: Number(attribute.confidence_score || 0),
+          label: attribute.draft_label ?? attribute.entity_type_label ?? '',
+          value: attribute.draft_value ?? attribute.extracted_value ?? '',
+        }
+        const pageEntries = boxesByPage.get(Number(page.page_number)) || []
+        pageEntries.push(entry)
+        boxesByPage.set(Number(page.page_number), pageEntries)
+      })
     }
 
-    attributeToTokens.set(attributeKey, tokenKeys)
+    attributeToBoxes.set(attributeKey, boxKeys)
   }
 
-  return { tokenToAttribute, attributeToTokens }
+  return { boxToAttribute, attributeToBoxes, boxesByPage }
 }
 
 function getDocumentSearchText(document) {
@@ -1660,6 +1670,8 @@ function ReconstructedTableCard({
   onRemoveColumn,
   onMergeCells,
   onSplitCell,
+  onSaveChanges,
+  saveStatus,
 }) {
   const rows = table.rows || []
   const tableConfidenceTone = confidenceBorderTone(Number(table.confidence_score || 0))
@@ -1679,7 +1691,7 @@ function ReconstructedTableCard({
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-[150px] flex-1">
             <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
-              {table.style?.layout_source === 'detected_rules' ? 'Page-rule reconstruction' : 'OCR-aligned reconstruction'}
+              {table.table_type === 'form' ? 'Form-like table' : table.style?.layout_source === 'gemini' ? 'Gemini table reading' : 'Reconstructed table'}
               {' · Page '}{table.page_number}
             </p>
             <input
@@ -1703,6 +1715,16 @@ function ReconstructedTableCard({
         />
         <div className="flex flex-wrap gap-1.5">
           <button type="button" onClick={() => onCompare(table)} className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100">Compare on page</button>
+          {onSaveChanges ? (
+            <button
+              type="button"
+              onClick={() => onSaveChanges(table)}
+              disabled={saveStatus === 'saving'}
+              className="rounded-lg border border-emerald-600 bg-emerald-600 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-60"
+            >
+              {saveStatus === 'saving' ? 'Saving...' : saveStatus === 'saved' ? 'Saved' : 'Save table changes'}
+            </button>
+          ) : null}
           <button type="button" onClick={() => onAddRow(table.id)} className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100">Add row</button>
           <button type="button" onClick={() => onRemoveRow(table.id)} disabled={rows.length <= 1} className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 disabled:opacity-40">Remove last row</button>
           <button type="button" onClick={() => onAddColumn(table.id)} className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100">Add column</button>
@@ -1754,7 +1776,14 @@ function ReconstructedTableCard({
                             <textarea
                               aria-label={`Cell ${rowIndex + 1}, ${Number(cell.column_index || 0) + 1}`}
                               value={cell.text || ''}
-                              rows={Math.min(5, Math.max(1, String(cell.text || '').split('\n').length))}
+                              rows={Math.min(14, Math.max(1, String(cell.text || '').split('\n').length))}
+                              ref={(element) => {
+                                // Grow with the content so long paragraphs in form-like cells are fully visible.
+                                if (element) {
+                                  element.style.height = 'auto'
+                                  element.style.height = `${element.scrollHeight}px`
+                                }
+                              }}
                               onClick={(event) => event.stopPropagation()}
                               onChange={(event) => onEditCell(table.id, cell.id, event.target.value)}
                               className={`w-full min-w-[52px] resize-y overflow-hidden rounded-sm bg-transparent p-0.5 text-xs leading-4 outline-none focus:bg-white focus:ring-1 focus:ring-cyan-600 ${cell.bold || cell.is_header ? 'font-semibold' : 'font-normal'}`}
@@ -1807,7 +1836,8 @@ function ViewerPage({
   onSaveSelectedAttributes,
   onRefreshDocument,
 }) {
-  const tokenRefs = useRef(new Map())
+  const boxRefs = useRef(new Map())
+  const pageRefs = useRef(new Map())
   const [editingAttributeId, setEditingAttributeId] = useState(null)
   const [reviewAttributes, setReviewAttributes] = useState(attributes)
   const [selectedReviewKeys, setSelectedReviewKeys] = useState(() => new Set())
@@ -1820,9 +1850,56 @@ function ViewerPage({
   const [selectedTableKeys, setSelectedTableKeys] = useState(() => new Set())
   const [selectedCellKeys, setSelectedCellKeys] = useState(() => new Set())
   const [selectedTextFieldKeys, setSelectedTextFieldKeys] = useState(() => new Set())
-  const [bulletFieldDraft, setBulletFieldDraft] = useState('')
   const initialTables = useMemo(() => collectDocumentTables(ocrPages, attributes), [attributes, ocrPages])
   const [detectedTables, setDetectedTables] = useState(initialTables)
+  const [tableSaveStatus, setTableSaveStatus] = useState({})
+
+  // Tables that were already saved as attributes can be edited here and saved back in place.
+  const savedTableAttributes = useMemo(() => {
+    const byTableId = new Map()
+    for (const attribute of attributes || []) {
+      if (attribute.id && attribute.table_data?.id) {
+        byTableId.set(attribute.table_data.id, attribute)
+      }
+    }
+    return byTableId
+  }, [attributes])
+
+  const saveTableChanges = async (table) => {
+    const attribute = savedTableAttributes.get(table.id)
+    if (!attribute) {
+      return
+    }
+    setReviewError('')
+    setTableSaveStatus((current) => ({ ...current, [table.id]: 'saving' }))
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/v1/attributes/correct`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          document_id: attribute.document_id ?? documentData?.id,
+          corrections: [
+            {
+              attribute_id: attribute.id,
+              original_prediction: attribute.extracted_value,
+              corrected_value: JSON.stringify({ kind: 'table', version: 1, table: { ...table, kind: 'table', version: 1 } }),
+              corrected_label: table.title || attribute.entity_type_label,
+              validation_status: attribute.validation_status,
+            },
+          ],
+        }),
+      })
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}))
+        throw new Error(result.detail || 'Failed to save table changes.')
+      }
+      setTableSaveStatus((current) => ({ ...current, [table.id]: 'saved' }))
+      await onRefreshDocument?.()
+    } catch (error) {
+      setTableSaveStatus((current) => ({ ...current, [table.id]: undefined }))
+      setReviewError(error.message || 'Failed to save table changes.')
+    }
+  }
 
   useEffect(() => {
     setDetectedTables(initialTables)
@@ -1832,38 +1909,13 @@ function ViewerPage({
 
   const textFieldEntries = useMemo(() => (reviewAttributes || []).filter((attribute) => attribute.kind !== 'table'), [reviewAttributes])
 
-  const selectedTableTokenKeys = useMemo(() => {
-    const tokenKeys = new Set()
-    for (const table of detectedTables) {
-      const selectedCells = (table.rows || []).flatMap((row) => row.cells || []).filter((cell) => selectedCellKeys.has(`${table.id}:${cell.id}`))
-      if (!selectedTableKeys.has(table.id) && !selectedCells.length) {
-        continue
-      }
-      for (const page of ocrPages || []) {
-        if (Number(page.page_number) !== Number(table.page_number)) {
-          continue
-        }
-        const selectedBoxes = selectedTableKeys.has(table.id) ? [table.bbox] : selectedCells.map((cell) => cell.bbox)
-        for (const line of page.lines || []) {
-          for (const token of line.tokens || []) {
-            const tokenKey = `${page.page_number}:${token.token_index}`
-            if (selectedBoxes.some((box) => boxesOverlap(box, token.bbox))) {
-              tokenKeys.add(tokenKey)
-            }
-          }
-        }
-      }
-    }
-    return tokenKeys
-  }, [detectedTables, ocrPages, selectedCellKeys, selectedTableKeys])
-
-  const { tokenToAttribute, attributeToTokens } = useMemo(
-    () => buildTokenAttributeIndex(reviewAttributes, ocrPages),
+  const { boxToAttribute, attributeToBoxes, boxesByPage } = useMemo(
+    () => buildAttributeBoxIndex(reviewAttributes, ocrPages),
     [reviewAttributes, ocrPages],
   )
 
   const isDraftReview = reviewAttributes.some((attribute) => attribute.saved === false)
-  const selectedTokenKeys = isDraftReview ? attributeToTokens.get([...selectedReviewKeys][0]) || [] : attributeToTokens.get(selectedAttributeId) || []
+  const selectedAttributeKeys = isDraftReview ? selectedReviewKeys : new Set(selectedAttributeId == null ? [] : [selectedAttributeId])
   const viewerQuery = viewerSearch.trim().toLowerCase()
 
   useEffect(() => {
@@ -1880,18 +1932,18 @@ function ViewerPage({
     if (isDraftReview || !selectedAttributeId) {
       return
     }
-    const firstTokenKey = (attributeToTokens.get(selectedAttributeId) || [])[0]
-    if (!firstTokenKey) {
+    const firstBoxKey = (attributeToBoxes.get(selectedAttributeId) || [])[0]
+    if (!firstBoxKey) {
       return
     }
-    const element = tokenRefs.current.get(firstTokenKey)
+    const element = boxRefs.current.get(firstBoxKey)
     if (element) {
       element.scrollIntoView({ behavior: 'smooth', block: 'center' })
     }
-  }, [attributeToTokens, isDraftReview, selectedAttributeId])
+  }, [attributeToBoxes, isDraftReview, selectedAttributeId])
 
-  const handleTokenClick = (tokenKey) => {
-    const attributeId = tokenToAttribute.get(tokenKey)
+  const handleBoxClick = (boxKey) => {
+    const attributeId = boxToAttribute.get(boxKey)
     if (attributeId) {
       if (isDraftReview) {
         setSelectedReviewKeys((current) => {
@@ -2135,10 +2187,8 @@ function ViewerPage({
 
   const compareTableOnPage = (table) => {
     setSelectedTableKeys((current) => new Set([...current, table.id]))
-    const page = ocrPages.find((item) => Number(item.page_number) === Number(table.page_number))
-    const tokens = (page?.lines || []).flatMap((line) => line.tokens || [])
-    const matchingToken = tokens.find((token) => boxesOverlap(table.bbox, token.bbox))
-    const element = matchingToken ? tokenRefs.current.get(`${page.page_number}:${matchingToken.token_index}`) : null
+    // Scroll to the table's own region; without a box, fall back to the page that holds it.
+    const element = boxRefs.current.get(`table:${table.id}`) || pageRefs.current.get(Number(table.page_number))
     element?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
 
@@ -2221,7 +2271,7 @@ function ViewerPage({
         draft_value: tableText || table.title || 'Table',
       }]
     })
-    const selectedFieldItems = allTextFieldEntries.filter((attribute) => selectedTextFieldKeys.has(getAttributeKey(attribute))).map((attribute) => ({
+    const selectedFieldItems = textFieldEntries.filter((attribute) => selectedTextFieldKeys.has(getAttributeKey(attribute))).map((attribute) => ({
       ...attribute,
       temp_id: attribute.temp_id || `field-${attribute.id || Date.now()}`,
       draft_label: attribute.draft_label || attribute.entity_type_label,
@@ -2274,166 +2324,6 @@ function ViewerPage({
     })
   }, [reviewAttributes, viewerQuery])
 
-  const bulletEntries = useMemo(() => {
-    const entries = []
-    for (const page of ocrPages || []) {
-      const pageLines = Array.isArray(page?.lines) ? page.lines : []
-      for (const line of pageLines) {
-        const rawText = String(line?.text || '').trim()
-        if (!rawText) {
-          continue
-        }
-
-        const bulletMatch = rawText.match(/^(\s*(?:[-*•]|\d+[.)]|[A-Za-z][.)])\s+)(.+)$/)
-        const normalized = (bulletMatch ? bulletMatch[2] : rawText).replace(/\s+/g, ' ').trim()
-        if (!normalized || normalized.length < 2) {
-          continue
-        }
-
-        const itemText = bulletMatch ? `${bulletMatch[1].trim() || '•'} ${normalized}` : `• ${normalized}`
-        const confidenceValues = (line.tokens || []).map((token) => Number(token.confidence)).filter((value) => Number.isFinite(value))
-        entries.push({
-          id: `${page.page_number}:${line.id || rawText}`,
-          pageNumber: page.page_number,
-          pageId: page.page_id,
-          bounding_boxes: (line.tokens || []).map((token) => token.bbox).filter((bbox) => Array.isArray(bbox) && bbox.length === 4),
-          confidence_score: confidenceValues.length ? confidenceValues.reduce((sum, value) => sum + value, 0) / confidenceValues.length / 100 : 0,
-          text: itemText,
-        })
-      }
-    }
-
-    if (!entries.length) {
-      for (const page of ocrPages || []) {
-        const pageText = String(page?.text || '').trim()
-        if (!pageText) {
-          continue
-        }
-        for (const paragraph of pageText.split(/\n+/)) {
-          const cleanText = paragraph.replace(/\s+/g, ' ').trim()
-          if (cleanText && cleanText.length >= 2) {
-            entries.push({
-              id: `${page.page_number}:${cleanText}`,
-              pageNumber: page.page_number,
-              pageId: page.page_id,
-              bounding_boxes: [],
-              confidence_score: 0,
-              text: `• ${cleanText}`,
-            })
-          }
-        }
-      }
-    }
-
-    return entries
-  }, [ocrPages])
-
-  const bulletFieldEntry = useMemo(() => {
-    if (!bulletEntries.length) {
-      return null
-    }
-    const extractedValue = bulletEntries.map((entry) => entry.text).join('\n')
-    return {
-      temp_id: 'detected-bulleted-text',
-      entity_type_label: 'Detected bullet list',
-      extracted_value: extractedValue,
-      original_prediction: extractedValue,
-      draft_label: 'Detected bullet list',
-      draft_value: bulletFieldDraft || extractedValue,
-      original_label: 'Detected bullet list',
-      original_value: extractedValue,
-      draft_validation_status: 'PENDING',
-      validation_status: 'PENDING',
-      confidence_score: bulletEntries.length
-        ? bulletEntries.reduce((sum, entry) => sum + Number(entry.confidence_score || 0), 0) / bulletEntries.length
-        : 0,
-      source: 'model',
-      kind: 'text_field',
-      saved: false,
-      page_number: bulletEntries[0]?.pageNumber || 1,
-      page_id: bulletEntries[0]?.pageId,
-      bounding_boxes: bulletEntries.flatMap((entry) => entry.bounding_boxes || []),
-      page_spans: bulletEntries.reduce((spans, entry) => {
-        const existing = spans.find((span) => Number(span.page_number) === Number(entry.pageNumber))
-        if (existing) {
-          existing.bounding_boxes.push(...(entry.bounding_boxes || []))
-        } else {
-          spans.push({ page_number: entry.pageNumber, bounding_boxes: [...(entry.bounding_boxes || [])] })
-        }
-        return spans
-      }, []),
-    }
-  }, [bulletEntries, bulletFieldDraft])
-
-  useEffect(() => {
-    setBulletFieldDraft(bulletEntries.map((entry) => entry.text).join('\n'))
-  }, [bulletEntries])
-
-  const allTextFieldEntries = useMemo(
-    () => (bulletFieldEntry ? [...textFieldEntries, bulletFieldEntry] : textFieldEntries),
-    [bulletFieldEntry, textFieldEntries],
-  )
-
-  const extractedBulletText = bulletEntries.map((entry) => entry.text).join('\n')
-
-  const [copyStatus, setCopyStatus] = useState('')
-  const [readStatus, setReadStatus] = useState('')
-
-  useEffect(() => {
-    return () => {
-      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-        window.speechSynthesis.cancel()
-      }
-    }
-  }, [])
-
-  const handleCopyBullets = async () => {
-    if (!extractedBulletText) {
-      setCopyStatus('No bulleted text available yet.')
-      return
-    }
-
-    try {
-      await navigator.clipboard.writeText(extractedBulletText)
-      setCopyStatus('Bulleted text copied to clipboard.')
-    } catch (error) {
-      const textarea = document.createElement('textarea')
-      textarea.value = extractedBulletText
-      textarea.setAttribute('readonly', 'true')
-      textarea.style.position = 'fixed'
-      textarea.style.opacity = '0'
-      document.body.appendChild(textarea)
-      textarea.select()
-      document.execCommand('copy')
-      document.body.removeChild(textarea)
-      setCopyStatus('Bulleted text copied.')
-    }
-
-    window.setTimeout(() => setCopyStatus(''), 1800)
-  }
-
-  const handleReadBullets = () => {
-    if (!extractedBulletText) {
-      setReadStatus('No bulleted text to read.')
-      return
-    }
-
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
-      setReadStatus('Speech playback is not available in this browser.')
-      return
-    }
-
-    window.speechSynthesis.cancel()
-    const utterance = new SpeechSynthesisUtterance(extractedBulletText)
-    utterance.rate = 0.9
-    utterance.pitch = 1
-    utterance.lang = 'en-US'
-    utterance.onend = () => setReadStatus('Finished reading bulleted text.')
-    utterance.onerror = () => setReadStatus('Unable to read the bulleted text.')
-    window.speechSynthesis.speak(utterance)
-    setReadStatus('Reading bulleted text...')
-  }
-
   if (viewerLoading) {
     return (
       <div className="grid gap-6 px-4 py-8 lg:grid-cols-[minmax(0,1.5fr)_minmax(340px,0.9fr)] lg:px-8">
@@ -2478,15 +2368,22 @@ function ViewerPage({
           <div className="space-y-5">
             {ocrPages.length ? (
               ocrPages.map((page) => (
-                <article key={page.page_number} className="overflow-hidden rounded-[28px] border border-slate-200 bg-white shadow-sm">
+                <article
+                  key={page.page_number}
+                  ref={(element) => {
+                    if (element) {
+                      pageRefs.current.set(Number(page.page_number), element)
+                    } else {
+                      pageRefs.current.delete(Number(page.page_number))
+                    }
+                  }}
+                  className="overflow-hidden rounded-[28px] border border-slate-200 bg-white shadow-sm"
+                >
                   <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
                     <div>
                       <p className="text-sm font-semibold text-slate-900">Page {page.page_number}</p>
-                      <p className="text-xs text-slate-500">Original source page with selectable OCR text layer</p>
+                      <p className="text-xs text-slate-500">Original source page with approximate attribute regions</p>
                     </div>
-                    <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-500">
-                      {(page.tokens || []).length} tokens
-                    </span>
                   </div>
 
                   <div className="p-5 sm:p-6">
@@ -2506,56 +2403,86 @@ function ViewerPage({
 
                         {page.image_url ? (
                           <div className="absolute inset-0 overflow-hidden rounded-xl">
-                            {(page.lines || []).flatMap((line) => line.tokens || []).map((token) => {
-                              const tokenKey = `${page.page_number}:${token.token_index}`
-                              const bbox = Array.isArray(token.bbox) && token.bbox.length === 4 ? token.bbox : null
-                              if (!bbox) {
-                                return null
-                              }
-
-                              const [x0, y0, x1, y1] = bbox
-                              const left = `${(x0 / 1000) * 100}%`
-                              const top = `${(y0 / 1000) * 100}%`
-                              const width = `${Math.max(0.5, ((x1 - x0) / 1000) * 100)}%`
-                              const height = `${Math.max(0.7, ((y1 - y0) / 1000) * 100)}%`
-                              const isMatchedAttribute = tokenToAttribute.has(tokenKey)
-                              const isSelectedAttribute = selectedTokenKeys.includes(tokenKey)
-                              const isSelectedTableRegion = selectedTableTokenKeys.has(tokenKey)
-                              const tokenConfidence = Number(token.confidence || 0)
-                              const confidenceClass = tokenConfidence >= 90
-                                ? 'token-confidence-high'
-                                : tokenConfidence >= 75
-                                  ? 'token-confidence-medium'
-                                  : 'token-confidence-low'
-                              const isSearchHit = viewerQuery && token.token.toLowerCase().includes(viewerQuery)
-                              const tokenClasses = [
-                                'absolute select-text whitespace-nowrap leading-none rounded px-0.5 transition-all cursor-pointer',
-                                'text-transparent selection:bg-amber-200/80 selection:text-slate-900',
-                                confidenceClass,
-                                isMatchedAttribute ? 'hover:bg-blue-200/45' : 'hover:bg-slate-200/35',
+                            {(detectedTables || [])
+                              .filter((table) => Number(table.page_number) === Number(page.page_number) && isValidBox(table.bbox))
+                              .map((table) => {
+                                const [x0, y0, x1, y1] = table.bbox
+                                const isSelectedTable = selectedTableKeys.has(table.id)
+                                return (
+                                  <div
+                                    key={`table:${table.id}`}
+                                    ref={(element) => {
+                                      if (element) {
+                                        boxRefs.current.set(`table:${table.id}`, element)
+                                      } else {
+                                        boxRefs.current.delete(`table:${table.id}`)
+                                      }
+                                    }}
+                                    className={`pointer-events-none absolute rounded ${isSelectedTable ? 'token-highlight-active border-2 border-blue-500' : ''}`}
+                                    style={{
+                                      left: `${(x0 / 1000) * 100}%`,
+                                      top: `${(y0 / 1000) * 100}%`,
+                                      width: `${Math.max(0.5, ((x1 - x0) / 1000) * 100)}%`,
+                                      height: `${Math.max(0.7, ((y1 - y0) / 1000) * 100)}%`,
+                                    }}
+                                  />
+                                )
+                              })}
+                            {(detectedTables || [])
+                              .filter((table) => Number(table.page_number) === Number(page.page_number))
+                              .flatMap((table) => (table.rows || []).flatMap((row) => row.cells || []).map((cell) => ({ table, cell })))
+                              .filter(({ table, cell }) => selectedCellKeys.has(`${table.id}:${cell.id}`) && isValidBox(cell.bbox))
+                              .map(({ table, cell }) => {
+                                const [x0, y0, x1, y1] = cell.bbox
+                                return (
+                                  <div
+                                    key={`cell:${table.id}:${cell.id}`}
+                                    className="token-highlight-active pointer-events-none absolute rounded border-2 border-blue-500"
+                                    style={{
+                                      left: `${(x0 / 1000) * 100}%`,
+                                      top: `${(y0 / 1000) * 100}%`,
+                                      width: `${Math.max(0.5, ((x1 - x0) / 1000) * 100)}%`,
+                                      height: `${Math.max(0.7, ((y1 - y0) / 1000) * 100)}%`,
+                                    }}
+                                  />
+                                )
+                              })}
+                            {(boxesByPage.get(Number(page.page_number)) || []).map((entry) => {
+                              const [x0, y0, x1, y1] = entry.box
+                              const isSelectedAttribute = selectedAttributeKeys.has(entry.attributeKey)
+                              const isSearchHit = viewerQuery && `${entry.label} ${entry.value}`.toLowerCase().includes(viewerQuery)
+                              const boxClasses = [
+                                'absolute rounded border-2 transition-all cursor-pointer',
+                                confidenceBorderTone(entry.score),
+                                'hover:bg-blue-200/45',
                                 isSearchHit ? 'token-highlight' : '',
-                                isSelectedAttribute || isSelectedTableRegion ? 'token-highlight-active' : '',
+                                isSelectedAttribute ? 'token-highlight-active ring-2 ring-blue-400' : '',
                               ]
                                 .filter(Boolean)
                                 .join(' ')
 
                               return (
-                                <span
-                                  key={tokenKey}
+                                <button
+                                  type="button"
+                                  key={entry.key}
                                   ref={(element) => {
                                     if (element) {
-                                      tokenRefs.current.set(tokenKey, element)
+                                      boxRefs.current.set(entry.key, element)
                                     } else {
-                                      tokenRefs.current.delete(tokenKey)
+                                      boxRefs.current.delete(entry.key)
                                     }
                                   }}
-                                  onClick={() => handleTokenClick(tokenKey)}
-                                  className={tokenClasses}
-                                  style={{ left, top, width, height, fontSize: '12px' }}
-                                  title={isMatchedAttribute ? 'Select matching attribute' : token.token}
-                                >
-                                  {token.token}
-                                </span>
+                                  onClick={() => handleBoxClick(entry.key)}
+                                  className={boxClasses}
+                                  style={{
+                                    left: `${(x0 / 1000) * 100}%`,
+                                    top: `${(y0 / 1000) * 100}%`,
+                                    width: `${Math.max(0.5, ((x1 - x0) / 1000) * 100)}%`,
+                                    height: `${Math.max(0.7, ((y1 - y0) / 1000) * 100)}%`,
+                                  }}
+                                  title={`${entry.label}: ${entry.value}`}
+                                  aria-label={`Select attribute ${entry.label}`}
+                                />
                               )
                             })}
                           </div>
@@ -2563,15 +2490,21 @@ function ViewerPage({
                       </div>
 
                       <p className="mt-3 text-xs text-slate-500">
-                        Select text directly on the page to copy OCR content.
+                        Click a highlighted region to select its attribute. Regions are approximate.
                       </p>
+                      {page.text ? (
+                        <details className="mt-3 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600">
+                          <summary className="cursor-pointer font-semibold text-slate-700">Page transcription</summary>
+                          <pre className="mt-2 max-h-64 select-text overflow-auto whitespace-pre-wrap font-sans">{page.text}</pre>
+                        </details>
+                      ) : null}
                     </div>
                   </div>
                 </article>
               ))
             ) : (
               <div className="rounded-[28px] border border-dashed border-slate-200 bg-white px-6 py-16 text-center text-sm text-slate-500">
-                No OCR text is available for this document yet.
+                No page text is available for this document yet.
               </div>
             )}
           </div>
@@ -2670,6 +2603,8 @@ function ViewerPage({
                     table={table}
                     selected={selectedTableKeys.has(table.id)}
                     selectedCellKeys={selectedCellKeys}
+                    onSaveChanges={!isDraftReview && savedTableAttributes.has(table.id) ? saveTableChanges : undefined}
+                    saveStatus={tableSaveStatus[table.id]}
                     onToggleTable={toggleTableSelection}
                     onToggleCell={toggleCellSelection}
                     onEditCell={editTableCell}
@@ -2687,17 +2622,16 @@ function ViewerPage({
                 ))
               ) : (
                 <div className="rounded-[24px] border border-dashed border-slate-200 bg-slate-50 px-4 py-12 text-center text-sm text-slate-500">
-                  No confident table layout was detected. This view only shows structures supported by page rules or repeated OCR column alignment.
+                  No tables were detected on these pages.
                 </div>
               )}
             </section>
           ) : (
             <section className="space-y-4">
-              {allTextFieldEntries.length ? (
-                allTextFieldEntries.map((attribute) => {
+              {textFieldEntries.length ? (
+                textFieldEntries.map((attribute) => {
                   const fieldKey = getAttributeKey(attribute)
                   const selected = selectedTextFieldKeys.has(fieldKey)
-                  const isBulletField = attribute.temp_id === 'detected-bulleted-text'
                   return (
                     <section key={fieldKey} className={`rounded-[24px] border-2 p-4 ${confidenceBorderTone(Number(attribute.confidence_score || 0))} ${selected ? 'bg-blue-50 ring-2 ring-blue-200' : ''}`}>
                       <div className="flex items-start justify-between gap-3">
@@ -2727,16 +2661,16 @@ function ViewerPage({
                           <span className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Label</span>
                           <input
                             value={attribute.draft_label}
-                            onChange={(event) => isBulletField ? undefined : updateReviewAttribute(fieldKey, 'draft_label', event.target.value)}
+                            onChange={(event) => updateReviewAttribute(fieldKey, 'draft_label', event.target.value)}
                             className="w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none"
                           />
                         </label>
                         <label className="block space-y-2">
                           <span className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Value</span>
                           <textarea
-                            value={isBulletField ? bulletFieldDraft : attribute.draft_value}
+                            value={attribute.draft_value}
                             rows={3}
-                            onChange={(event) => isBulletField ? setBulletFieldDraft(event.target.value) : updateReviewAttribute(fieldKey, 'draft_value', event.target.value)}
+                            onChange={(event) => updateReviewAttribute(fieldKey, 'draft_value', event.target.value)}
                             className="w-full resize-y rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none"
                           />
                         </label>
@@ -3361,7 +3295,7 @@ export default function App() {
         if (normalized === 'QUEUED') {
           setActivity('Queued for extraction...')
         } else if (normalized === 'PROCESSING') {
-          setActivity('Running OCR and extracting attributes...')
+          setActivity('Reading the document with Gemini...')
         }
         if (normalized === 'PROCESSED') {
           setProcessingProgress(100)
@@ -3380,7 +3314,11 @@ export default function App() {
         if (normalized === 'FAILED') {
           setProcessingProgress(100)
           setActivity('Processing failed')
-          setProcessingError('Document processing failed. Please try again or upload a different file.')
+          setProcessingError(
+            result.processing_error
+              ? `Document processing failed: ${result.processing_error}`
+              : 'Document processing failed. Please try again or upload a different file.',
+          )
           return
         }
 

@@ -1,41 +1,25 @@
-# OCR Learning Workflow
+# Document Workflow
 
-This guide explains exactly where files go and the order to follow when creating ground truth, evaluating predictions, and training the OCR model.
-
-## Important
-
-- The system extracts fields with a multimodal LLM (Claude) from the page image plus OCR tokens.
-- CVAT is a separate annotation application. It is not part of this project's Docker Compose stack.
-- CVAT creates ground-truth annotations. It does not train anything; the annotations are used to measure accuracy.
-- Never use the model's predictions as ground truth.
-- Use the same generated page images for both CVAT and prediction.
+Gemini reads the page images, decides the document type and which attributes the document contains, and returns
+each attribute with a confidence score and page number. Nothing is trained and there are no field lists.
 
 ## Folder Layout
 
 ```text
 D:\OCR\
   datasets/
-    raw-pages/                 Generated PNG pages used by CVAT and prediction
+    raw-pages/                 Generated PNG pages (one folder per document id)
       <document_id>/
         page-001.png
         page-002.png
-    cvat/                      CVAT export files
-      annotations.xml
-    ground-truth/
-      ground_truth.jsonl       Converted CVAT annotations
-    predictions/
-      predictions.jsonl        Model predictions
-  uploads/                     Original uploaded PDFs; runtime storage
-  samples/                     Sample files for development/tests
+  uploads/                     Original uploaded files; runtime storage
 ```
 
-The old `assets/` folder was removed. Page images are now served by the backend from `datasets/raw-pages/` through `/pages/...`.
-
-## Complete Workflow
+## Running a document
 
 ### 1. Start the system
 
-Start the backend:
+Set `GEMINI_API_KEY` in your `.env` first (see the README configuration table), then start the backend:
 
 ```powershell
 cd D:\OCR
@@ -55,146 +39,19 @@ Open:
 - API: http://127.0.0.1:8000/
 - API docs: http://127.0.0.1:8000/docs/
 
-### 2. Upload a PDF once
+### 2. Upload a document
 
-Upload the PDF through the dashboard. The system automatically creates a document ID, for example `42`.
+Upload through the dashboard. The system creates a document ID, for example `42`, stores the original as
+`uploads/42/source.pdf`, writes the page images to `datasets/raw-pages/42/`, and sends those images to Gemini.
 
-It stores the original file here:
+If Gemini fails, the processing screen shows the reason (for example a bad key or a rate limit) and Retry runs
+the document again.
 
-```text
-uploads/42/source.pdf
-```
+### 3. Review
 
-It creates the page images here:
-
-```text
-datasets/raw-pages/42/page-001.png
-datasets/raw-pages/42/page-002.png
-```
-
-The page images are generated in the correct page order. Do not rename, edit, or reorder them before CVAT annotation.
-
-### 3. Annotate the page images in CVAT
-
-CVAT runs separately. Follow [cvat/README.md](cvat/README.md) to install and start it.
-
-In CVAT:
-
-1. Create a task.
-2. Upload the exact PNG files from `datasets/raw-pages/<document_id>/`.
-3. Create labels such as `TOTAL`, `DATE`, `VENDOR`, or other fields in your documents.
-4. Draw rectangles around complete field values.
-5. Finish all pages.
-6. Export as **CVAT for images 1.1 XML**.
-
-Place the exported file here:
-
-```text
-datasets/cvat/annotations.xml
-```
-
-The CVAT XML file is the annotation result. You do not need to create a JSON file manually for every page.
-
-### 4. Convert the CVAT result
-
-From the backend directory:
-
-```powershell
-cd D:\OCR\backend
-
-python -m app.dataset_tools cvat-to-jsonl `
-  --xml ..\datasets\cvat\annotations.xml `
-  --image-root ..\datasets\raw-pages\42 `
-  --output ..\datasets\ground-truth\ground_truth.jsonl
-```
-
-The converter runs the project's OCR over the same page images and assigns each OCR token the label of the CVAT rectangle it overlaps.
-
-The result is:
-
-```text
-datasets/ground-truth/ground_truth.jsonl
-```
-
-Review this file before relying on it. Pay special attention to words that cross annotation-box boundaries.
-
-### 5. Generate LLM predictions (needs `ANTHROPIC_API_KEY`)
-
-You do not need to upload the PDF again. Use the saved page-image folder:
-
-```powershell
-cd D:\OCR\backend
-
-python -m app.dataset_tools predict `
-  --raw ..\datasets\raw-pages\42 `
-  --output ..\datasets\predictions\predictions.jsonl
-```
-
-The LLM's labels are saved here:
-
-```text
-datasets/predictions/predictions.jsonl
-```
-
-### 6. Compare predictions with ground truth
-
-```powershell
-cd D:\OCR\backend
-
-python -m app.dataset_tools evaluate `
-  --predictions ..\datasets\predictions\predictions.jsonl `
-  --ground-truth ..\datasets\ground-truth\ground_truth.jsonl
-```
-
-The evaluation reports:
-
-- Token accuracy
-- Bounding-box IoU match rate
-- Per-label precision
-- Per-label recall
-- Per-label F1 score
-- Optional field exact-match rate
-
-Comparison measures the extractor. It does not change it.
-
-### 7. Improve the prompt or schemas
-
-Extraction is prompt-driven, so there is no training step. If a label scores poorly:
-
-1. Look at the per-label results from step 6 and open a few failing pages.
-2. Adjust the field list or aliases in `backend/app/document_schemas.py`, or the instructions in `backend/app/llm_extractor.py`.
-3. Run steps 5 and 6 again and compare.
-
-If you tune against these pages, keep a separate set of documents for a final check that you have not tuned against.
-
-## Simple Process Summary
-
-```text
-PDF uploaded once
-    -> datasets/raw-pages/<document_id>/page-###.png
-
-Same page PNGs
-    -> CVAT annotation
-    -> CVAT annotations.xml
-    -> ground-truth/ground_truth.jsonl
-
-Same page PNGs
-    -> LLM prediction
-    -> predictions/predictions.jsonl
-
-Ground truth + predictions
-    -> evaluation metrics
-```
-
-## What Goes Where
-
-| Item | Location |
-|---|---|
-| Original PDF | `uploads/<document_id>/source.pdf` |
-| Generated page images | `datasets/raw-pages/<document_id>/` |
-| CVAT export | `datasets/cvat/annotations.xml` |
-| Converted ground truth | `datasets/ground-truth/ground_truth.jsonl` |
-| Model guesses | `datasets/predictions/predictions.jsonl` |
+Open the document, check the highlighted regions against the page, edit labels and values, select the
+attributes to keep and save them. Values below 75% confidence, and values Gemini could not find in its own
+transcription of the page, are marked for review.
 
 ## Fresh Start Cleanup
 
@@ -202,14 +59,11 @@ To begin again, stop the backend and remove only generated/user data:
 
 ```powershell
 Remove-Item -Recurse -Force datasets\raw-pages\*
-Remove-Item -Recurse -Force datasets\cvat\*
-Remove-Item -Recurse -Force datasets\ground-truth\source\*
-Remove-Item -Recurse -Force datasets\predictions\*
 Remove-Item -Recurse -Force uploads\*
 Remove-Item -Force ocr_system.db, backend\ocr_system.db -ErrorAction SilentlyContinue
 ```
 
-Keep the source code, `samples/`, and the README files.
+Keep the source code and the README files.
 
 ## Online Multi-User Deployment
 

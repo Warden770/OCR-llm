@@ -7,7 +7,6 @@ import subprocess
 import tempfile
 import time
 import threading
-from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 import uuid
@@ -28,21 +27,21 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.db import SessionLocal, get_db, set_rls_user
 from app.auth import CurrentUserId, owner_scope
-from app.document_schemas import classify_document_type
-from app.llm_extractor import LLMExtractionError, build_llm_payloads, create_extraction_service, get_extraction_backend
+from app.gemini_extractor import (
+    ExtractionCanceled,
+    GeminiExtractionError,
+    GeminiExtractionService,
+    build_attribute_payloads,
+    build_table_layouts,
+    gemini_is_configured,
+    normalize_document_type,
+)
 from app.models import Attribute, Document as DocumentRecord, Page
-from app.ocr_processor import extract_tokens_with_bboxes
-from app.routing_engine import build_ocr_baseline_payloads
-from app.table_reconstruction import reconstruct_tables
 from app.tasks import celery_app
 from app.storage import delete_file, download_file, storage_enabled, upload_file
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-_OCR_PAGE_CACHE: OrderedDict[tuple[int, str, int], tuple[list[dict[str, Any]], dict[str, Any]]] = OrderedDict()
-_OCR_PAGE_LOCKS: dict[tuple[int, str, int], threading.Lock] = {}
-_OCR_PAGE_CACHE_LOCK = threading.Lock()
-_OCR_PAGE_CACHE_LIMIT = 128
 
 SUPPORTED_FORMATS = {
     ".pdf": {"application/pdf"},
@@ -60,7 +59,6 @@ SUPPORTED_FORMATS = {
 IMAGE_EXTENSIONS = {".jpeg", ".jpg", ".png", ".tiff", ".tif", ".bmp"}
 UPLOAD_ROOT = Path(os.getenv("UPLOAD_DIR", "uploads"))
 RAW_DATASET_ROOT = Path(os.getenv("RAW_DATASET_PAGES_DIR", "datasets/raw-pages"))
-POPPLER_PATH = os.getenv("POPPLER_PATH")
 SOFFICE_CMD = os.getenv("SOFFICE_CMD", "soffice")
 DOCUMENT_STATUSES = frozenset({"PENDING", "QUEUED", "PROCESSING", "PROCESSED", "FAILED", "APPROVED", "CANCELED"})
 DOCUMENT_STATUS_TRANSITIONS = {
@@ -233,6 +231,7 @@ def get_document(document_id: int, user_id: CurrentUserId, db: Session = Depends
         "page_count": document.page_count,
         "timestamp": document.timestamp,
         "status": document.status,
+        "processing_error": document.processing_error if document.status == "FAILED" else None,
         "pages": [
             {
                 "id": page.id,
@@ -372,38 +371,21 @@ def list_documents(user_id: CurrentUserId, q: str | None = Query(None), limit: i
     return {"documents": summaries, "query": q or ""}
 
 
-def _get_page_ocr_data(page: Page, image_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    image_stat = image_path.stat()
-    cache_key = (page.id, str(image_path.resolve()), image_stat.st_mtime_ns)
-    with _OCR_PAGE_CACHE_LOCK:
-        cached = _OCR_PAGE_CACHE.get(cache_key)
-        if cached is not None:
-            _OCR_PAGE_CACHE.move_to_end(cache_key)
-            return cached
-        page_lock = _OCR_PAGE_LOCKS.setdefault(cache_key, threading.Lock())
-
+def _page_dimensions(image_path: Path) -> tuple[int | None, int | None]:
     try:
-        with page_lock:
-            with _OCR_PAGE_CACHE_LOCK:
-                cached = _OCR_PAGE_CACHE.get(cache_key)
-                if cached is not None:
-                    _OCR_PAGE_CACHE.move_to_end(cache_key)
-                    return cached
-            tokens = extract_tokens_with_bboxes(image_path)
-            table_layout = reconstruct_tables(image_path, tokens, page.id, page.page_number)
-            with _OCR_PAGE_CACHE_LOCK:
-                _OCR_PAGE_CACHE[cache_key] = (tokens, table_layout)
-                _OCR_PAGE_CACHE.move_to_end(cache_key)
-                while len(_OCR_PAGE_CACHE) > _OCR_PAGE_CACHE_LIMIT:
-                    _OCR_PAGE_CACHE.popitem(last=False)
-            return tokens, table_layout
-    finally:
-        with _OCR_PAGE_CACHE_LOCK:
-            _OCR_PAGE_LOCKS.pop(cache_key, None)
+        with Image.open(image_path) as image:
+            return image.width, image.height
+    except (OSError, ValueError):
+        return None, None
 
 
 @router.get("/documents/{document_id}/ocr")
 def get_document_ocr(document_id: int, user_id: CurrentUserId, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Return the page transcription and table layout stored when Gemini read the document.
+
+    No OCR runs here. Word-level tokens no longer exist, so ``tokens`` is always empty and ``lines``
+    are the stored transcription split on newlines.
+    """
     document = db.query(DocumentRecord).filter(DocumentRecord.id == document_id, owner_scope(DocumentRecord.owner_id, user_id)).first()
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -413,43 +395,32 @@ def get_document_ocr(document_id: int, user_id: CurrentUserId, db: Session = Dep
         image_path = Path(page.image_path)
         if not image_path.exists():
             image_path = RAW_DATASET_ROOT / str(document.id) / f"page-{page.page_number:03d}.png"
-        if not image_path.exists():
-            raise HTTPException(status_code=404, detail=f"Rasterized page missing for page {page.page_number}")
+        page_width, page_height = _page_dimensions(image_path) if image_path.exists() else (None, None)
 
-        tokens, table_layout = _get_page_ocr_data(page, image_path)
-        lines_by_key: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
-        for token_index, token in enumerate(tokens):
-            key = (
-                int(token.get("block_num", 0)),
-                int(token.get("paragraph_num", 0)),
-                int(token.get("line_num", 0)),
-            )
-            lines_by_key.setdefault(key, []).append({**token, "token_index": token_index})
-
-        lines: list[dict[str, Any]] = []
-        for line_index, (line_key, line_tokens) in enumerate(lines_by_key.items()):
-            lines.append(
-                {
-                    "id": f"{page.page_number}-{line_index}",
-                    "block_num": line_key[0],
-                    "paragraph_num": line_key[1],
-                    "line_num": line_key[2],
-                    "text": " ".join(token["token"] for token in line_tokens),
-                    "tokens": line_tokens,
-                }
-            )
+        text = page.ocr_text or ""
+        lines = [
+            {
+                "id": f"{page.page_number}-{line_index}",
+                "block_num": 0,
+                "paragraph_num": 0,
+                "line_num": line_index,
+                "text": line_text,
+                "tokens": [],
+            }
+            for line_index, line_text in enumerate(line for line in text.split("\n") if line.strip())
+        ]
 
         page_payloads.append(
             {
                 "page_id": page.id,
                 "page_number": page.page_number,
                 "image_url": f"/api/v1/documents/{document.id}/pages/{page.page_number}/image",
-                "text": "\n".join(line["text"] for line in lines),
+                "text": text,
                 "lines": lines,
-                "tokens": tokens,
-                "page_width": table_layout["page_width"],
-                "page_height": table_layout["page_height"],
-                "tables": table_layout["tables"],
+                "tokens": [],
+                "page_width": page_width,
+                "page_height": page_height,
+                "tables": list(page.ocr_layout or []),
             }
         )
 
@@ -539,6 +510,7 @@ def process_document_job(document_id: int, source_key: str, original_name: str, 
     processing_start_time: float | None = None
     previous_status: str | None = None
     previous_timing: tuple[Any, Any, Any, int, str] = (None, None, None, 0, "unknown")
+    previous_error: str | None = None
 
     try:
         document = db.query(DocumentRecord).filter(DocumentRecord.id == document_id, DocumentRecord.owner_id == owner_id).first()
@@ -560,6 +532,7 @@ def process_document_job(document_id: int, source_key: str, original_name: str, 
         previous_page_ids = [page.id for page in previous_page_rows]
         previous_page_paths = [Path(page.image_path) for page in previous_page_rows]
         previous_storage_keys = [page.storage_key for page in previous_page_rows if page.storage_key]
+        previous_error = document.processing_error
         previous_timing = (
             document.processing_started_at,
             document.processing_finished_at,
@@ -573,6 +546,7 @@ def process_document_job(document_id: int, source_key: str, original_name: str, 
         document.processing_started_at = processing_started_at
         document.processing_finished_at = None
         document.processing_duration_seconds = None
+        document.processing_error = None
         _transition_document_status(document, "PROCESSING")
         db.commit()
 
@@ -580,6 +554,10 @@ def process_document_job(document_id: int, source_key: str, original_name: str, 
         if not path.exists():
             logger.error("Source file missing for %s: %s", document_id, source_key)
             raise FileNotFoundError(f"Source file missing: {source_key}")
+
+        # Fail before the (slow) rasterization when Gemini cannot be called at all.
+        if not gemini_is_configured():
+            raise GeminiExtractionError("GEMINI_API_KEY is not set")
 
         extension = path.suffix.lower()
         if extension == ".pdf":
@@ -591,17 +569,41 @@ def process_document_job(document_id: int, source_key: str, original_name: str, 
         else:
             raise ValueError(f"Unsupported format for processing: {extension}")
 
-        detected_document_type = _detect_document_type(page_paths, original_name)
-        document.document_type = detected_document_type["document_type"]
-        logger.info(
-            "Detected document type for %s: %s (confidence=%.3f)",
-            original_name,
-            detected_document_type["document_type"],
-            float(detected_document_type.get("confidence", 0.0)),
-        )
+        def _is_canceled() -> bool:
+            status = db.execute(select(DocumentRecord.status).where(DocumentRecord.id == document_id)).scalar()
+            return status == "CANCELED"
 
-        staged_attributes: list[dict[str, Any]] = []
+        # Gemini reads the page images before any Page row is written, so no database write lock is held
+        # during the (slow) network calls and a cancel request is never blocked.
+        try:
+            extraction = GeminiExtractionService().extract_document(
+                [(index, page_path) for index, page_path in enumerate(page_paths, start=1)],
+                should_cancel=_is_canceled,
+            )
+        except ExtractionCanceled:
+            db.rollback()
+            _cleanup_artifacts(page_paths, new_storage_keys)
+            db.refresh(document)
+            return {
+                "document_id": document_id,
+                "original_name": original_name,
+                "document_type": str(document.document_type or "unknown"),
+                "page_count": document.page_count,
+                "pages": [],
+                "status": "canceled",
+            }
 
+        document.document_type = normalize_document_type(extraction.document_type)
+        logger.info("Gemini identified document type for %s: %s", original_name, document.document_type)
+        if extraction.untranscribed_pages:
+            logger.warning(
+                "Gemini would not transcribe page(s) %s of document %s (RECITATION); their attributes are sent to review",
+                extraction.untranscribed_pages,
+                document_id,
+            )
+
+        page_ids: dict[int, int] = {}
+        page_rows: dict[int, Page] = {}
         for index, page_path in enumerate(page_paths, start=1):
             storage_key = f"{document.owner_id}/{processing_artifact_id}/pages/page-{index:03d}.png"
             page = Page(
@@ -609,42 +611,45 @@ def process_document_job(document_id: int, source_key: str, original_name: str, 
                 page_number=index,
                 image_path=str(page_path),
                 storage_key=storage_key,
+                ocr_text=extraction.page_text.get(index, ""),
+                ocr_layout=[],
             )
             db.add(page)
             db.flush()
+            page_ids[index] = page.id
+            page_rows[index] = page
             new_page_ids.append(page.id)
             new_storage_keys.append(storage_key)
             upload_file(page_path, storage_key)
 
-            attribute_payloads = _build_attribute_payloads_for_page(
-                page.id,
-                document_id,
-                page_path,
-                document_type=document.document_type,
-            )
-            for payload in attribute_payloads:
-                staged_attributes.append(
-                    {
-                        "temp_id": str(uuid.uuid4()),
-                        "page_id": page.id,
-                        "page_number": index,
-                        "document_id": document_id,
-                        "entity_type_label": payload["entity_type_label"],
-                        "extracted_value": payload["extracted_value"],
-                        "original_prediction": payload["extracted_value"],
+        for page_number, tables in build_table_layouts(extraction, page_ids).items():
+            page_rows[page_number].ocr_layout = tables
+
+        staged_attributes: list[dict[str, Any]] = []
+        for payload in build_attribute_payloads(extraction, page_ids, document_id):
+            staged_attributes.append(
+                {
+                    "temp_id": str(uuid.uuid4()),
+                    "page_id": payload["page_id"],
+                    "page_number": payload["page_number"],
+                    "document_id": document_id,
+                    "entity_type_label": payload["entity_type_label"],
+                    "extracted_value": payload["extracted_value"],
+                    "original_prediction": payload["extracted_value"],
+                    "bounding_boxes": payload["bounding_boxes"],
+                    "page_spans": [{
+                        "page_id": payload["page_id"],
+                        "page_number": payload["page_number"],
+                        "text": payload["extracted_value"],
                         "bounding_boxes": payload["bounding_boxes"],
-                        "page_spans": [{
-                            "page_id": page.id,
-                            "page_number": index,
-                            "text": payload["extracted_value"],
-                            "bounding_boxes": payload["bounding_boxes"],
-                        }],
-                        "confidence_score": payload["confidence_score"],
-                        "validation_status": payload["validation_status"],
-                        "source": "model",
-                        "saved": False,
-                    }
-                )
+                    }],
+                    "confidence_score": payload["confidence_score"],
+                    "validation_status": payload["validation_status"],
+                    "source": "model",
+                    "saved": False,
+                    "continues_from_previous_page": payload["continues_from_previous_page"],
+                }
+            )
 
         staged_attributes = _merge_staged_attributes(staged_attributes)
         db.expire(document)
@@ -673,7 +678,7 @@ def process_document_job(document_id: int, source_key: str, original_name: str, 
             db.query(Page).filter(Page.id.in_(previous_page_ids)).delete(synchronize_session=False)
         db.commit()
         _cleanup_artifacts(previous_page_paths, previous_storage_keys)
-    except Exception:
+    except Exception as exc:
         db.rollback()
         _cleanup_artifacts(page_paths, new_storage_keys)
         document = db.get(DocumentRecord, document_id)
@@ -688,10 +693,12 @@ def process_document_job(document_id: int, source_key: str, original_name: str, 
                     document.page_count,
                     document.document_type,
                 ) = previous_timing
+                document.processing_error = previous_error
                 document.status = previous_status
             elif processing_started_at is not None and processing_start_time is not None:
                 document.processing_finished_at = datetime.now(timezone.utc)
                 document.processing_duration_seconds = time.perf_counter() - processing_start_time
+                document.processing_error = _failure_reason(exc)
                 _transition_document_status(document, "FAILED")
             db.commit()
         logger.exception("Document processing failed for %s (%s)", document_id, original_name)
@@ -720,33 +727,6 @@ def _store_raw_dataset_pages(page_paths: list[Path], document_id: str | int) -> 
         shutil.copy2(page_path, output_path)
         stored_paths.append(output_path)
     return stored_paths
-
-
-def _detect_document_type(page_paths: list[Path], original_name: str) -> dict[str, Any]:
-    if not page_paths:
-        return {"document_type": "unknown", "confidence": 0.0, "scores": {}}
-
-    first_page_tokens = extract_tokens_with_bboxes(page_paths[0])
-    text = " ".join(token["token"] for token in first_page_tokens)
-    line_count = len(
-        {
-            (
-                int(token.get("block_num", 0)),
-                int(token.get("paragraph_num", 0)),
-                int(token.get("line_num", 0)),
-            )
-            for token in first_page_tokens
-        }
-    )
-    return classify_document_type(
-        text=text,
-        filename=original_name,
-        layout_hints={
-            "page_count": len(page_paths),
-            "token_count": len(first_page_tokens),
-            "line_count": line_count,
-        },
-    )
 
 
 def _rasterize_pdf(path: Path, document_id: str) -> List[Path]:
@@ -1012,51 +992,39 @@ def _normalize_image_document(path: Path, document_id: str) -> List[Path]:
     return page_paths
 
 
-def _build_attribute_payloads_for_page(
-    page_id: int,
-    document_id: int,
-    image_path: Path,
-    document_type: str | None = None,
-) -> List[dict[str, Any]]:
-    tokens = extract_tokens_with_bboxes(image_path)
-    if not tokens:
-        return []
-
-    backend = get_extraction_backend()
-    if backend in {"llm", "gemini"}:
-        try:
-            extraction = create_extraction_service(backend).extract_page(image_path, tokens, document_type)
-            return build_llm_payloads(extraction, tokens, page_id=page_id, document_id=document_id)
-        except LLMExtractionError as exc:
-            logger.warning("LLM extraction failed for %s; using OCR baseline: %s", image_path, exc)
-
-    return build_ocr_baseline_payloads(
-        page_id=page_id,
-        document_id=document_id,
-        tokens=tokens,
-        document_type=document_type,
-    )
-
-
 def _merge_staged_attributes(attributes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Merge semantically labeled continuations across adjacent pages."""
+    """Join values that really continue across pages.
+
+    Labels are free-form now, so equal labels on adjacent pages (two "Total" lines, say) are not enough:
+    the later attribute must have been flagged ``continues_from_previous_page`` by the model, and it is
+    appended to the latest attribute with the same label that ends on the previous page.
+    """
     merged: list[dict[str, Any]] = []
     for attribute in attributes:
         label = str(attribute.get("entity_type_label", "")).strip()
-        previous = merged[-1] if merged else None
-        if (
-            previous
-            and label
-            and label.upper() != "OCR"
-            and label == previous.get("entity_type_label")
-            and int(attribute.get("page_number", 0) or 0) == int(previous.get("page_number", 0) or 0) + 1
-        ):
-            previous["extracted_value"] = f'{previous["extracted_value"].rstrip()}\n\n{attribute["extracted_value"].lstrip()}'
-            previous["original_prediction"] = previous["extracted_value"]
-            previous["bounding_boxes"] = list(previous.get("bounding_boxes") or []) + list(attribute.get("bounding_boxes") or [])
-            previous["page_spans"] = list(previous.get("page_spans") or []) + list(attribute.get("page_spans") or [])
-            previous["confidence_score"] = min(float(previous.get("confidence_score", 0.0)), float(attribute.get("confidence_score", 0.0)))
-            previous["validation_status"] = "APPROVED" if float(previous["confidence_score"]) >= 0.75 else "HITL"
+        page_number = int(attribute.get("page_number", 0) or 0)
+        target = None
+        if label and attribute.get("continues_from_previous_page"):
+            for candidate in reversed(merged):
+                spans = candidate.get("page_spans") or []
+                last_page = int(spans[-1].get("page_number", 0) or 0) if spans else int(candidate.get("page_number", 0) or 0)
+                if str(candidate.get("entity_type_label", "")).strip().casefold() == label.casefold() and last_page == page_number - 1:
+                    target = candidate
+                    break
+        if target is None:
+            merged.append(attribute)
             continue
-        merged.append(attribute)
+        target["extracted_value"] = f'{target["extracted_value"].rstrip()}\n\n{attribute["extracted_value"].lstrip()}'
+        target["original_prediction"] = target["extracted_value"]
+        target["bounding_boxes"] = list(target.get("bounding_boxes") or []) + list(attribute.get("bounding_boxes") or [])
+        target["page_spans"] = list(target.get("page_spans") or []) + list(attribute.get("page_spans") or [])
+        target["confidence_score"] = min(float(target.get("confidence_score", 0.0)), float(attribute.get("confidence_score", 0.0)))
+        target["validation_status"] = "APPROVED" if float(target["confidence_score"]) >= 0.75 else "HITL"
     return merged
+
+
+def _failure_reason(exc: BaseException) -> str:
+    """A short reason that is safe to show to the user: no payloads, response bodies or keys."""
+    if isinstance(exc, GeminiExtractionError):
+        return str(exc)[:500]
+    return f"Processing failed ({type(exc).__name__})"

@@ -1,88 +1,1018 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from PIL import Image
 
-from app.gemini_extractor import GeminiExtractionService
-from app.llm_extractor import LLMExtractionError, build_llm_payloads
+from app.gemini_extractor import (
+    DEFAULT_GEMINI_MODEL,
+    DocumentExtraction,
+    ExtractedAttribute,
+    ExtractedCell,
+    ExtractedTable,
+    ExtractionCanceled,
+    GeminiExtractionError,
+    GeminiExtractionService,
+    build_attribute_payloads,
+    build_table_layouts,
+    normalize_document_type,
+)
 
-TOKENS = [
-    {"token": "Total", "bbox": [0, 40, 60, 60], "confidence": 95.0, "block_num": 1, "paragraph_num": 1, "line_num": 1},
-    {"token": "42.00", "bbox": [70, 40, 130, 60], "confidence": 95.0, "block_num": 1, "paragraph_num": 1, "line_num": 1},
-]
+API_KEY = "test-key-SECRET-123"
+RESPONSE_BODY_MARKER = "BODY-MARKER-do-not-leak"
 
 
-def _response(fields=None, status=200, raw_body=None):
-    body = raw_body if raw_body is not None else {
-        "candidates": [{"content": {"parts": [{"text": json.dumps({"fields": fields or []})}]}}]
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _attribute(label="Student Name", value="John Doe", page=1, confidence=0.98, **extra) -> dict[str, Any]:
+    return {"attribute": label, "value": value, "confidence": confidence, "page": page, **extra}
+
+
+def _payload(document_type="Student Registration Form", pages=None, attributes=None, tables=None) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "document_type": document_type,
+        "pages": pages if pages is not None else [{"page": 1, "text": "Student Name: John Doe"}],
+        "attributes": attributes if attributes is not None else [_attribute()],
     }
-    return SimpleNamespace(status_code=status, json=lambda: body)
+    if tables is not None:
+        body["tables"] = tables
+    return body
+
+
+def _response(payload=None, status=200, headers=None, finish_reason=None, raw_text=None, body=None):
+    if body is None:
+        text = raw_text if raw_text is not None else json.dumps(payload if payload is not None else _payload())
+        candidate: dict[str, Any] = {"content": {"parts": [{"text": text}]}}
+        if finish_reason:
+            candidate["finishReason"] = finish_reason
+        body = {"candidates": [candidate]}
+    return SimpleNamespace(status_code=status, json=lambda: body, headers=headers or {})
+
+
+class FakeTransport:
+    """Replays queued responses (or raises queued exceptions) and records every call."""
+
+    def __init__(self, *responses):
+        self.queue = list(responses)
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, url, headers, payload, timeout):
+        self.calls.append({"url": url, "headers": headers, "payload": payload, "timeout": timeout})
+        item = self.queue.pop(0) if len(self.queue) > 1 else self.queue[0]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _service(transport, **kwargs) -> tuple[GeminiExtractionService, list[float]]:
+    sleeps: list[float] = []
+    kwargs.setdefault("pages_per_request", 6)
+    service = GeminiExtractionService(
+        model="test-model",
+        api_key=API_KEY,
+        http_post=transport,
+        sleep=sleeps.append,
+        timeout_seconds=30,
+        request_delay_seconds=kwargs.pop("request_delay_seconds", 0.0),
+        **kwargs,
+    )
+    return service, sleeps
 
 
 @pytest.fixture
-def page_image(tmp_path):
-    path = tmp_path / "page-001.png"
-    Image.new("RGB", (200, 100), "white").save(path)
-    return path
+def pages(tmp_path):
+    def make(count: int, size=(200, 100)) -> list[tuple[int, Any]]:
+        result = []
+        for number in range(1, count + 1):
+            path = tmp_path / f"page-{number:03d}.png"
+            Image.new("RGB", size, "white").save(path)
+            result.append((number, path))
+        return result
+
+    return make
 
 
-def _service(response, calls=None):
-    def post(url, headers, payload, timeout):
-        if calls is not None:
-            calls.append({"url": url, "headers": headers, "payload": payload, "timeout": timeout})
-        if isinstance(response, Exception):
-            raise response
-        return response
-
-    return GeminiExtractionService(model="test-model", api_key="test-key", http_post=post)
-
-
-def test_request_shape_and_key_in_header_only(page_image) -> None:
-    calls: list[dict] = []
-    _service(_response(), calls).extract_page(page_image, TOKENS, "invoice")
-
-    call = calls[0]
-    assert call["url"].endswith("/models/test-model:generateContent")
-    assert "test-key" not in call["url"]
-    assert call["headers"]["x-goog-api-key"] == "test-key"
+def _page_labels(call) -> list[str]:
     parts = call["payload"]["contents"][0]["parts"]
-    assert "inlineData" in parts[0]
-    assert "[0]Total [1]42.00" in parts[1]["text"]
+    return [part["text"] for part in parts if "text" in part and part["text"].startswith("Page ")]
+
+
+# ---------------------------------------------------------------------------
+# request shape
+# ---------------------------------------------------------------------------
+
+def test_request_shape_key_only_in_header_and_no_attribute_enum(pages) -> None:
+    transport = FakeTransport(_response(_payload(pages=[{"page": 1, "text": "a"}, {"page": 2, "text": "b"}], attributes=[])))
+    service, _ = _service(transport)
+
+    service.extract_document(pages(2))
+
+    call = transport.calls[0]
+    assert call["url"].endswith("/models/test-model:generateContent")
+    assert API_KEY not in call["url"]
+    assert call["headers"]["x-goog-api-key"] == API_KEY
+    assert API_KEY not in json.dumps(call["payload"])
+    assert call["timeout"] == 30
+
+    parts = call["payload"]["contents"][0]["parts"]
+    assert [list(part)[0] for part in parts[:4]] == ["text", "inlineData", "text", "inlineData"]
+    assert parts[0]["text"] == "Page 1" and parts[2]["text"] == "Page 2"
+    assert parts[1]["inlineData"]["mimeType"] == "image/jpeg"
+    assert "1, 2" in parts[-1]["text"]
+
     config = call["payload"]["generationConfig"]
+    assert config["temperature"] == 0
     assert config["responseMimeType"] == "application/json"
-    label_schema = config["responseSchema"]["properties"]["fields"]["items"]["properties"]["label"]
-    assert "total_amount" in label_schema["enum"]
+    schema = config["responseSchema"]
+    assert '"enum"' not in json.dumps(schema["properties"]["attributes"])  # attribute names are free-form
+    table_props = schema["properties"]["tables"]["items"]["properties"]
+    assert table_props["table_type"]["enum"] == ["data", "form"]
+    assert {"cells", "row_count", "column_count", "column_widths", "row_heights", "bordered"} <= set(table_props)
+    assert {"row", "column", "row_span", "column_span", "text", "is_header"} == set(table_props["cells"]["items"]["properties"])
+    assert schema["properties"]["attributes"]["items"]["properties"]["attribute"] == {"type": "STRING"}
+    assert call["payload"]["systemInstruction"]["parts"][0]["text"]
 
 
-def test_fields_become_grounded_payloads(page_image) -> None:
-    extraction = _service(
-        _response([{"label": "total_amount", "value": "42.00", "token_indices": [1], "confidence": 0.95}])
-    ).extract_page(page_image, TOKENS, "invoice")
-    payload = build_llm_payloads(extraction, TOKENS, page_id=1, document_id=1)[0]
-    assert payload["bounding_boxes"] == [[70, 40, 130, 60]]
-    assert payload["validation_status"] == "APPROVED"
+def test_default_model_comes_from_environment_then_constant(monkeypatch) -> None:
+    monkeypatch.delenv("GEMINI_EXTRACTION_MODEL", raising=False)
+    assert GeminiExtractionService(api_key="k").model == DEFAULT_GEMINI_MODEL
+    monkeypatch.setenv("GEMINI_EXTRACTION_MODEL", "custom-model")
+    assert GeminiExtractionService(api_key="k").model == "custom-model"
+
+
+def test_settings_read_from_environment_and_fall_back_when_invalid(monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_PAGES_PER_REQUEST", "3")
+    monkeypatch.setenv("GEMINI_IMAGE_MAX_EDGE", "1024")
+    monkeypatch.setenv("GEMINI_TIMEOUT_SECONDS", "45")
+    monkeypatch.setenv("GEMINI_REQUEST_DELAY_SECONDS", "1.5")
+    service = GeminiExtractionService(api_key="k")
+    assert (service.pages_per_request, service.image_max_edge, service.timeout_seconds, service.request_delay_seconds) == (3, 1024, 45.0, 1.5)
+
+    monkeypatch.setenv("GEMINI_PAGES_PER_REQUEST", "not-a-number")
+    monkeypatch.setenv("GEMINI_IMAGE_MAX_EDGE", "-5")
+    monkeypatch.setenv("GEMINI_TIMEOUT_SECONDS", "")
+    service = GeminiExtractionService(api_key="k")
+    assert (service.pages_per_request, service.image_max_edge, service.timeout_seconds) == (6, 2048, 120.0)
+
+
+def test_large_pages_are_downscaled_to_the_configured_edge(pages) -> None:
+    transport = FakeTransport(_response(_payload(attributes=[])))
+    service, _ = _service(transport, image_max_edge=512)
+
+    service.extract_document(pages(1, size=(2000, 1000)))
+
+    data = transport.calls[0]["payload"]["contents"][0]["parts"][1]["inlineData"]["data"]
+    with Image.open(io.BytesIO(base64.b64decode(data))) as image:
+        assert max(image.size) == 512
+
+
+def test_missing_api_key_fails_clearly(pages, monkeypatch) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    transport = FakeTransport(_response())
+    service = GeminiExtractionService(model="m", http_post=transport)
+
+    with pytest.raises(GeminiExtractionError, match="GEMINI_API_KEY is not set"):
+        service.extract_document(pages(1))
+    assert transport.calls == []
+
+
+def test_unreadable_page_image_fails_the_document(tmp_path) -> None:
+    broken = tmp_path / "page-001.png"
+    broken.write_bytes(b"fake-png")
+    service, _ = _service(FakeTransport(_response()))
+
+    with pytest.raises(GeminiExtractionError, match="Page 1 image could not be read"):
+        service.extract_document([(1, broken)])
+
+
+# ---------------------------------------------------------------------------
+# multi-page handling
+# ---------------------------------------------------------------------------
+
+def test_long_documents_are_chunked_and_merged_in_order(pages) -> None:
+    transport = FakeTransport(
+        _response(_payload("Invoice", [{"page": n, "text": f"t{n}"} for n in (1, 2, 3)], [_attribute("Total", "1", page=2)])),
+        _response(_payload("Something Else", [{"page": n, "text": f"t{n}"} for n in (4, 5, 6)], [_attribute("Tax", "2", page=5)])),
+        _response(_payload("Third", [{"page": 7, "text": "t7"}], [_attribute("Due Date", "3", page=7)])),
+    )
+    service, sleeps = _service(transport, pages_per_request=3, request_delay_seconds=0.5)
+
+    result = service.extract_document(pages(7))
+
+    assert [_page_labels(call) for call in transport.calls] == [
+        ["Page 1", "Page 2", "Page 3"],
+        ["Page 4", "Page 5", "Page 6"],
+        ["Page 7"],
+    ]
+    assert result.document_type == "Invoice"  # taken from the first chunk
+    assert sorted(result.page_text) == [1, 2, 3, 4, 5, 6, 7]
+    assert [(a.label, a.page) for a in result.attributes] == [("Total", 2), ("Tax", 5), ("Due Date", 7)]
+    assert sleeps == [0.5, 0.5]  # a delay between requests, none before the first
+    assert '"Invoice"' in transport.calls[1]["payload"]["contents"][0]["parts"][-1]["text"]
+    assert "Invoice" not in transport.calls[0]["payload"]["contents"][0]["parts"][-1]["text"]
+
+
+def test_request_size_limit_lowers_the_chunk_size(pages) -> None:
+    transport = FakeTransport(_response(_payload(attributes=[])))
+    service, _ = _service(transport, pages_per_request=10)
+    service.max_request_bytes = 1  # every page is "too big" to share a request
+
+    service.extract_document(pages(3))
+
+    assert [_page_labels(call) for call in transport.calls] == [["Page 1"], ["Page 2"], ["Page 3"]]
+
+
+def test_max_tokens_splits_the_chunk_and_retries(pages) -> None:
+    transport = FakeTransport(
+        _response(finish_reason="MAX_TOKENS", payload={}),
+        _response(_payload("Invoice", [{"page": 1, "text": "a"}, {"page": 2, "text": "b"}], [_attribute("A", "1", page=1)])),
+        _response(_payload("Other", [{"page": 3, "text": "c"}, {"page": 4, "text": "d"}], [_attribute("B", "2", page=4)])),
+    )
+    service, _ = _service(transport)
+
+    result = service.extract_document(pages(4))
+
+    assert [_page_labels(call) for call in transport.calls] == [
+        ["Page 1", "Page 2", "Page 3", "Page 4"],
+        ["Page 1", "Page 2"],
+        ["Page 3", "Page 4"],
+    ]
+    assert result.document_type == "Invoice"
+    assert [a.label for a in result.attributes] == ["A", "B"]
+    assert sorted(result.page_text) == [1, 2, 3, 4]
+
+
+def test_max_tokens_on_a_single_page_fails(pages) -> None:
+    transport = FakeTransport(_response(finish_reason="MAX_TOKENS", payload={}))
+    service, _ = _service(transport)
+
+    with pytest.raises(GeminiExtractionError, match="page 1"):
+        service.extract_document(pages(1))
+    assert len(transport.calls) == 1
+
+
+def _system_prompt(call) -> str:
+    return call["payload"]["systemInstruction"]["parts"][0]["text"]
+
+
+def test_recitation_splits_the_chunk_so_other_pages_keep_their_transcription(pages) -> None:
+    transport = FakeTransport(
+        _response(finish_reason="RECITATION", payload={}),  # pages 1-4 together
+        _response(_payload("Syllabus", [{"page": 1, "text": "a"}, {"page": 2, "text": "b"}], [_attribute("Course Code", "CSC 106", page=1)])),
+        _response(finish_reason="RECITATION", payload={}),  # pages 3-4 together
+        _response(_payload("Syllabus", [{"page": 3, "text": "c"}], [_attribute("Units", "3", page=3)])),
+        _response(_payload("Syllabus", [{"page": 4, "text": "d"}], [_attribute("Term", "1st Semester", page=4)])),
+    )
+    service, _ = _service(transport)
+
+    result = service.extract_document(pages(4))
+
+    assert [_page_labels(call) for call in transport.calls] == [
+        ["Page 1", "Page 2", "Page 3", "Page 4"],
+        ["Page 1", "Page 2"],
+        ["Page 3", "Page 4"],
+        ["Page 3"],
+        ["Page 4"],
+    ]
+    assert all("do NOT transcribe" not in _system_prompt(call) for call in transport.calls)
+    assert [a.label for a in result.attributes] == ["Course Code", "Units", "Term"]
+    assert sorted(result.page_text) == [1, 2, 3, 4]
+    assert result.untranscribed_pages == []
+
+
+def test_recitation_on_a_single_page_retries_without_a_transcription(pages) -> None:
+    transport = FakeTransport(
+        _response(finish_reason="RECITATION", payload={}),
+        _response(_payload("Syllabus", [{"page": 1, "text": ""}], [_attribute("University Vision", "A globally engaged University", page=1)])),
+    )
+    service, _ = _service(transport, request_delay_seconds=0.25)
+
+    result = service.extract_document(pages(1))
+
+    assert len(transport.calls) == 2
+    assert "do NOT transcribe" not in _system_prompt(transport.calls[0])
+    assert "do NOT transcribe" in _system_prompt(transport.calls[1])
+    assert _page_labels(transport.calls[1]) == ["Page 1"]
+    assert [a.label for a in result.attributes] == ["University Vision"]
+    assert result.untranscribed_pages == [1]
+
+
+def test_the_first_recitation_retry_keeps_the_tables(pages) -> None:
+    table = {"page": 1, "title": "Course Schedule", "rows": [["Week", "Topic"], ["1-3", "Introduction"]]}
+    transport = FakeTransport(
+        _response(finish_reason="RECITATION", payload={}),
+        _response(_payload("Syllabus", [{"page": 1, "text": ""}], [_attribute("Course Code", "CSC 106")], tables=[table])),
+    )
+    service, _ = _service(transport)
+
+    result = service.extract_document(pages(1))
+
+    assert len(transport.calls) == 2
+    retry_prompt = _system_prompt(transport.calls[1])
+    assert "do NOT transcribe" in retry_prompt and "any tables" in retry_prompt
+    assert "do not return any tables" not in retry_prompt
+    assert [t.title for t in result.tables] == ["Course Schedule"]
+    assert result.untranscribed_pages == [1]
+
+
+def test_a_second_recitation_stop_falls_back_to_attributes_only(pages) -> None:
+    transport = FakeTransport(
+        _response(finish_reason="RECITATION", payload={}),
+        _response(finish_reason="RECITATION", payload={}),
+        _response(_payload("Syllabus", [{"page": 1, "text": ""}], [_attribute("Course Code", "CSC 106")])),
+    )
+    service, _ = _service(transport)
+
+    result = service.extract_document(pages(1))
+
+    assert len(transport.calls) == 3
+    assert "do not return any tables" in _system_prompt(transport.calls[2])
+    assert [a.label for a in result.attributes] == ["Course Code"]
+    assert result.untranscribed_pages == [1]
+
+
+def test_prompt_asks_for_the_body_of_letters_and_both_kinds_of_tables(pages) -> None:
+    transport = FakeTransport(_response(_payload(attributes=[])))
+    service, _ = _service(transport)
+
+    service.extract_document(pages(1))
+
+    call = transport.calls[0]
+    prompt = call["payload"]["systemInstruction"]["parts"][0]["text"]
+    for expected in (
+        "letters, memos", "main body", "one item per line", "never summarized or paraphrased",
+        "visible borders and lines", "merged cells", "conventional table", "form-like table",
+        "never split them into independent attributes", "Do not decide from the number of rows or columns",
+        "is not a table", "row_span and column_span", "column_widths and row_heights", "continues on the next page",
+    ):
+        assert expected in prompt
+    assert "every table on these pages in the tables list" in call["payload"]["contents"][0]["parts"][-1]["text"]
+
+
+def test_untranscribed_pages_send_their_attributes_to_review() -> None:
+    extraction = DocumentExtraction(
+        document_type="Syllabus",
+        page_text={1: "", 2: "Units 3"},
+        attributes=[ExtractedAttribute("Course Code", "CSC 106", 0.99, 1), ExtractedAttribute("Units", "3", 0.99, 2)],
+        untranscribed_pages=[1],
+    )
+
+    payloads = build_attribute_payloads(extraction, {1: 11, 2: 12}, 1)
+
+    assert [(p["confidence_score"], p["validation_status"]) for p in payloads] == [(0.5, "HITL"), (0.99, "APPROVED")]
+
+
+def test_recitation_that_persists_without_a_transcription_fails_with_a_clear_reason(pages) -> None:
+    transport = FakeTransport(_response(finish_reason="RECITATION", payload={}))
+    service, _ = _service(transport)
+
+    with pytest.raises(GeminiExtractionError, match=r"would not read page 1 \(RECITATION\)"):
+        service.extract_document(pages(1))
+
+    # normal request, then without a transcription (tables kept), then attributes only
+    assert len(transport.calls) == 3
+
+
+def test_recitation_retry_respects_cancellation(pages) -> None:
+    transport = FakeTransport(_response(finish_reason="RECITATION", payload={}))
+    service, _ = _service(transport)
+    answers = iter([False, True])
+
+    with pytest.raises(ExtractionCanceled):
+        service.extract_document(pages(1), should_cancel=lambda: next(answers))
+
+    assert len(transport.calls) == 1
+
+
+def test_a_failing_chunk_fails_the_whole_document(pages) -> None:
+    transport = FakeTransport(_response(_payload(attributes=[])), _response(status=403))
+    service, _ = _service(transport, pages_per_request=1)
+
+    with pytest.raises(GeminiExtractionError, match="HTTP 403"):
+        service.extract_document(pages(2))
+
+
+def test_cancellation_is_checked_before_every_request(pages) -> None:
+    transport = FakeTransport(_response(_payload(attributes=[])))
+    service, _ = _service(transport, pages_per_request=1)
+
+    with pytest.raises(ExtractionCanceled):
+        service.extract_document(pages(2), should_cancel=lambda: True)
+    assert transport.calls == []
+
+    answers = iter([False, True])
+    transport = FakeTransport(_response(_payload(attributes=[])))
+    service, _ = _service(transport, pages_per_request=1)
+    with pytest.raises(ExtractionCanceled):
+        service.extract_document(pages(2), should_cancel=lambda: next(answers))
+    assert len(transport.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# failure modes
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404])
+def test_client_errors_fail_immediately_without_retry(pages, status) -> None:
+    transport = FakeTransport(_response(status=status, body={"error": RESPONSE_BODY_MARKER}))
+    service, sleeps = _service(transport)
+
+    with pytest.raises(GeminiExtractionError, match=f"HTTP {status}") as excinfo:
+        service.extract_document(pages(1))
+
+    assert len(transport.calls) == 1 and sleeps == []
+    assert RESPONSE_BODY_MARKER not in str(excinfo.value)
+    assert API_KEY not in str(excinfo.value)
+
+
+def test_rate_limit_is_retried_honouring_retry_after(pages) -> None:
+    transport = FakeTransport(_response(status=429, headers={"Retry-After": "2"}), _response(_payload(attributes=[])))
+    service, sleeps = _service(transport)
+
+    result = service.extract_document(pages(1))
+
+    assert len(transport.calls) == 2
+    assert sleeps == [2.0]
+    assert result.attributes == []
+
+
+def test_retry_after_is_capped_and_backoff_is_exponential(pages) -> None:
+    transport = FakeTransport(
+        _response(status=429, headers={"Retry-After": "9999"}),
+        _response(status=503),
+        _response(status=500),
+        _response(_payload(attributes=[])),
+    )
+    service, sleeps = _service(transport)
+
+    service.extract_document(pages(1))
+
+    assert sleeps == [60.0, 2.0, 4.0]
+
+
+def test_server_errors_give_up_after_three_retries(pages) -> None:
+    transport = FakeTransport(_response(status=503, body={"error": RESPONSE_BODY_MARKER}))
+    service, sleeps = _service(transport)
+
+    with pytest.raises(GeminiExtractionError, match="HTTP 503") as excinfo:
+        service.extract_document(pages(1))
+
+    assert len(transport.calls) == 4  # first attempt + 3 retries
+    assert sleeps == [1.0, 2.0, 4.0]
+    assert RESPONSE_BODY_MARKER not in str(excinfo.value)
+
+
+def test_rate_limit_that_never_clears_reports_it(pages) -> None:
+    transport = FakeTransport(_response(status=429))
+    service, _ = _service(transport)
+
+    with pytest.raises(GeminiExtractionError, match=r"HTTP 429 \(rate limit"):
+        service.extract_document(pages(1))
+
+
+def test_transport_error_is_retried_once_then_reports_type_only(pages) -> None:
+    class ReadTimeout(Exception):
+        pass
+
+    transport = FakeTransport(ReadTimeout(f"timed out talking to {API_KEY}"), _response(_payload(attributes=[])))
+    service, _ = _service(transport)
+    assert service.extract_document(pages(1)).attributes == []
+    assert len(transport.calls) == 2
+
+    transport = FakeTransport(ReadTimeout(f"timed out talking to {API_KEY}"))
+    service, _ = _service(transport)
+    with pytest.raises(GeminiExtractionError, match="Gemini request failed: ReadTimeout") as excinfo:
+        service.extract_document(pages(1))
+    assert len(transport.calls) == 2
+    assert API_KEY not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None and excinfo.value.__suppress_context__
+
+
+def test_blocked_prompt_fails(pages) -> None:
+    body = {"promptFeedback": {"blockReason": "SAFETY"}, "candidates": []}
+    service, _ = _service(FakeTransport(_response(body=body)))
+    with pytest.raises(GeminiExtractionError, match=r"blocked the request \(SAFETY\)"):
+        service.extract_document(pages(1))
+
+
+def test_empty_candidates_fail(pages) -> None:
+    service, _ = _service(FakeTransport(_response(body={"candidates": []})))
+    with pytest.raises(GeminiExtractionError, match="no candidates"):
+        service.extract_document(pages(1))
+
+
+@pytest.mark.parametrize("reason", ["SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT"])
+def test_unfinished_candidates_fail(pages, reason) -> None:
+    service, _ = _service(FakeTransport(_response(finish_reason=reason, payload=_payload())))
+    with pytest.raises(GeminiExtractionError, match=reason):
+        service.extract_document(pages(1))
+
+
+def test_malformed_json_fails_without_echoing_the_text(pages) -> None:
+    service, _ = _service(FakeTransport(_response(raw_text=f"{RESPONSE_BODY_MARKER} {{not json")))
+    with pytest.raises(GeminiExtractionError, match="not valid JSON") as excinfo:
+        service.extract_document(pages(1))
+    assert RESPONSE_BODY_MARKER not in str(excinfo.value)
 
 
 @pytest.mark.parametrize(
-    "response",
+    "payload",
     [
-        _response(status=429, raw_body={"error": {"message": "secret detail"}}),
-        _response(raw_body={"candidates": []}),
-        _response(raw_body={"candidates": [{"content": {"parts": [{"text": "not json"}]}}]}),
-        _response(raw_body={"candidates": [{"content": {"parts": [{"text": json.dumps({"fields": "x"})}]}}]}),
-        RuntimeError("secret detail"),
+        [],  # not an object
+        {"pages": [], "attributes": []},  # no document_type
+        {"document_type": "x", "pages": [], "attributes": "nope"},
+        {"document_type": "x", "pages": [{"page": "one", "text": "t"}], "attributes": []},
+        {"document_type": "x", "pages": [], "attributes": [{"attribute": "A", "value": "v", "confidence": 0.9}]},  # no page
+        {"document_type": "x", "pages": [], "attributes": [{"attribute": "A", "value": "v", "confidence": "high", "page": 1}]},
+        {"document_type": "x", "pages": [], "attributes": [{"attribute": 5, "value": "v", "confidence": 0.9, "page": 1}]},
+        {"document_type": "x", "pages": [], "attributes": [_attribute(continues_from_previous_page="yes")]},
     ],
 )
-def test_failures_raise_without_leaking_details(page_image, response) -> None:
-    with pytest.raises(LLMExtractionError) as error:
-        _service(response).extract_page(page_image, TOKENS, "invoice")
-    assert "secret detail" not in str(error.value)
+def test_responses_that_do_not_match_the_schema_fail(pages, payload) -> None:
+    service, _ = _service(FakeTransport(_response(payload)))
+    with pytest.raises(GeminiExtractionError, match="expected structure"):
+        service.extract_document(pages(1))
 
 
-def test_missing_key_raises(page_image, monkeypatch) -> None:
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    with pytest.raises(LLMExtractionError, match="GEMINI_API_KEY"):
-        GeminiExtractionService(http_post=lambda *a, **k: None).extract_page(page_image, TOKENS)
+def test_empty_content_fails(pages) -> None:
+    service, _ = _service(FakeTransport(_response(raw_text="  ")))
+    with pytest.raises(GeminiExtractionError, match="no content"):
+        service.extract_document(pages(1))
+
+
+# ---------------------------------------------------------------------------
+# parsing
+# ---------------------------------------------------------------------------
+
+def test_box_2d_is_converted_to_x0_y0_x1_y1_and_clamped(pages) -> None:
+    attributes = [
+        _attribute("A", "1", box_2d=[100, 200, 300, 400]),  # [ymin, xmin, ymax, xmax]
+        _attribute("B", "2", box_2d=[-5, -10, 1200, 1500]),
+        _attribute("C", "3", box_2d=[10, 10, 10, 50]),  # zero height
+        _attribute("D", "4", box_2d=[1, 2, 3]),  # wrong length
+        _attribute("E", "5", box_2d=["a", 1, 2, 3]),
+        _attribute("F", "6"),
+        _attribute("G", "7", box_2d=[300, 400, 100, 200]),  # reversed corners
+    ]
+    service, _ = _service(FakeTransport(_response(_payload(attributes=attributes))))
+
+    result = service.extract_document(pages(1))
+
+    assert [a.box for a in result.attributes] == [[200, 100, 400, 300], [0, 0, 1000, 1000], None, None, None, None, [200, 100, 400, 300]]
+
+
+def test_thought_parts_are_ignored_and_optional_fields_default(pages) -> None:
+    body = {
+        "candidates": [
+            {
+                "finishReason": "STOP",
+                "content": {"parts": [{"text": "thinking...", "thought": True}, {"text": json.dumps(_payload(attributes=[_attribute()]))}]},
+            }
+        ]
+    }
+    service, _ = _service(FakeTransport(_response(body=body)))
+
+    result = service.extract_document(pages(1))
+
+    assert result.attributes[0].continues_from_previous_page is False
+    assert result.tables == []
+
+
+
+
+# ---------------------------------------------------------------------------
+# conversion to staged payloads
+# ---------------------------------------------------------------------------
+
+PAGE_IDS = {1: 101, 2: 102, 3: 103}
+
+
+def _extraction(attributes, page_text=None, document_type="Student Registration Form") -> DocumentExtraction:
+    return DocumentExtraction(
+        document_type=document_type,
+        page_text=page_text if page_text is not None else {1: "Student Name: John Doe\nTotal 1,200.00", 2: "Total 5"},
+        attributes=attributes,
+    )
+
+
+def test_payload_shape_status_threshold_and_box() -> None:
+    extraction = _extraction(
+        [
+            ExtractedAttribute("Student Name", "John Doe", 0.98, 1, box=[10, 20, 30, 40]),
+            ExtractedAttribute("Total Amount", "1,200.00", 0.75, 1),
+            ExtractedAttribute("Maybe", "John", 0.74, 1),
+        ]
+    )
+
+    payloads = build_attribute_payloads(extraction, PAGE_IDS, document_id=9)
+
+    assert payloads[0] == {
+        "page_id": 101,
+        "page_number": 1,
+        "document_id": 9,
+        "entity_type_label": "Student Name",
+        "extracted_value": "John Doe",
+        "bounding_boxes": [[10, 20, 30, 40]],
+        "confidence_score": 0.98,
+        "validation_status": "APPROVED",
+        "document_type": "student_registration_form",
+        "continues_from_previous_page": False,
+    }
+    assert payloads[1]["validation_status"] == "APPROVED" and payloads[1]["bounding_boxes"] == []
+    assert payloads[2]["validation_status"] == "HITL"
+
+
+def test_value_missing_from_the_page_transcription_is_capped_at_half() -> None:
+    extraction = _extraction(
+        [
+            ExtractedAttribute("Student Name", "John Doe", 0.99, 1),
+            ExtractedAttribute("Course", "Computer Science", 0.99, 1),  # not on the page
+            ExtractedAttribute("Total", "5", 0.99, 1),  # on page 2 only
+            ExtractedAttribute("Low", "Jane", 0.3, 1),  # already below the cap
+        ]
+    )
+
+    by_label = {p["entity_type_label"]: p for p in build_attribute_payloads(extraction, PAGE_IDS, 1)}
+
+    assert by_label["Student Name"]["confidence_score"] == 0.99
+    assert by_label["Course"]["confidence_score"] == 0.5 and by_label["Course"]["validation_status"] == "HITL"
+    assert by_label["Total"]["confidence_score"] == 0.5
+    assert by_label["Low"]["confidence_score"] == 0.3
+
+
+def test_grounding_ignores_case_spacing_and_punctuation() -> None:
+    extraction = _extraction([ExtractedAttribute("Amount", "1200.00", 0.9, 1), ExtractedAttribute("Name", "JOHN  DOE", 0.9, 1)])
+
+    payloads = build_attribute_payloads(extraction, PAGE_IDS, 1)
+
+    assert [p["confidence_score"] for p in payloads] == [0.9, 0.9]
+
+
+def test_page_without_a_transcription_sends_everything_to_review() -> None:
+    extraction = _extraction([ExtractedAttribute("Name", "John Doe", 0.99, 1)], page_text={})
+
+    assert build_attribute_payloads(extraction, PAGE_IDS, 1)[0]["confidence_score"] == 0.5
+
+
+def test_empty_and_out_of_range_attributes_are_dropped_and_values_trimmed() -> None:
+    extraction = _extraction(
+        [
+            ExtractedAttribute("Name", "   ", 0.9, 1),
+            ExtractedAttribute("   ", "John Doe", 0.9, 1),
+            ExtractedAttribute("Name", "John Doe", 0.9, 0),
+            ExtractedAttribute("Name", "John Doe", 0.9, 4),
+            ExtractedAttribute("  Student   Name ", "  John Doe  ", 0.9, 1),
+        ]
+    )
+
+    payloads = build_attribute_payloads(extraction, PAGE_IDS, 1)
+
+    assert len(payloads) == 1
+    assert payloads[0]["entity_type_label"] == "Student Name"
+    assert payloads[0]["extracted_value"] == "John Doe"
+
+
+def test_a_page_with_no_text_and_no_attributes_is_not_an_error() -> None:
+    assert build_attribute_payloads(_extraction([], page_text={1: ""}), PAGE_IDS, 1) == []
+
+
+def test_confidence_is_clamped_and_labels_truncated() -> None:
+    extraction = _extraction(
+        [
+            ExtractedAttribute("Over", "John", 1.7, 1),
+            ExtractedAttribute("Under", "Doe", -2, 1),
+            ExtractedAttribute("L" * 300, "John Doe", 0.9, 1),
+        ]
+    )
+
+    payloads = build_attribute_payloads(extraction, PAGE_IDS, 1)
+
+    assert payloads[0]["confidence_score"] == 1.0
+    assert payloads[1]["confidence_score"] == 0.0
+    assert len(payloads[2]["entity_type_label"]) == 128
+
+
+def test_duplicate_label_and_value_on_a_page_keeps_the_higher_confidence() -> None:
+    extraction = _extraction(
+        [
+            ExtractedAttribute("Student Name", "John Doe", 0.6, 1),
+            ExtractedAttribute("student name", "john  doe", 0.95, 1),
+            ExtractedAttribute("Student Name", "John Doe", 0.8, 1, box=[1, 1, 5, 5]),
+        ]
+    )
+
+    payloads = build_attribute_payloads(extraction, PAGE_IDS, 1)
+
+    assert len(payloads) == 1
+    assert payloads[0]["confidence_score"] == 0.95
+    # the same label and value on a different page is not a duplicate
+    extraction = _extraction(
+        [ExtractedAttribute("Total", "5", 0.9, 2), ExtractedAttribute("Total", "5", 0.9, 1)],
+        page_text={1: "Total 5", 2: "Total 5"},
+    )
+    assert len(build_attribute_payloads(extraction, PAGE_IDS, 1)) == 2
+
+
+def test_continuation_flag_is_carried_but_never_set_on_the_first_page() -> None:
+    extraction = _extraction(
+        [
+            ExtractedAttribute("Notes", "John", 0.9, 1, continues_from_previous_page=True),
+            ExtractedAttribute("Notes", "Doe", 0.9, 2, continues_from_previous_page=True),
+        ],
+        page_text={1: "John", 2: "Doe"},
+    )
+
+    payloads = build_attribute_payloads(extraction, PAGE_IDS, 1)
+
+    assert [p["continues_from_previous_page"] for p in payloads] == [False, True]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Student Registration Form", "student_registration_form"),
+        ("  Invoice / Receipt (2024)  ", "invoice_receipt_2024"),
+        ("", "unknown"),
+        (None, "unknown"),
+        ("!!!", "unknown"),
+        ("x" * 100, "x" * 64),
+        ("a" * 63 + " b", "a" * 63),
+    ],
+)
+def test_document_type_is_normalized(raw, expected) -> None:
+    assert normalize_document_type(raw) == expected
+
+
+# ---------------------------------------------------------------------------
+# tables
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# tables: conventional tables and form-like layouts with merged cells
+# ---------------------------------------------------------------------------
+
+def _table_item(**overrides) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "page": 1,
+        "title": "Subjects",
+        "table_type": "data",
+        "row_count": 2,
+        "column_count": 2,
+        "cells": [
+            {"row": 0, "column": 0, "text": "Code"},
+            {"row": 0, "column": 1, "text": "Title"},
+            {"row": 1, "column": 0, "text": "IT101"},
+            {"row": 1, "column": 1, "text": "Intro"},
+        ],
+    }
+    item.update(overrides)
+    return item
+
+
+def _read_tables(pages, service_factory, *items):
+    transport = FakeTransport(_response(_payload(attributes=[], tables=list(items))))
+    service, _ = service_factory(transport)
+    return service.extract_document(pages(1)).tables
+
+
+FORM_CELLS = [
+    {"row": 0, "column": 0, "column_span": 2, "text": "University Vision and Mission", "is_header": True},
+    {"row": 1, "column": 0, "text": "Vision", "is_header": True},
+    {"row": 1, "column": 1, "text": "A globally engaged university."},
+    {"row": 2, "column": 0, "row_span": 2, "text": "Goals\nResearch. Instruction. Production."},
+    {"row": 2, "column": 1, "text": "Objectives"},
+    {"row": 3, "column": 1, "text": "1. To train students.\n2. To provide skills."},
+]
+
+
+def test_a_form_like_table_keeps_merged_cells_headings_and_long_text_in_one_table(pages) -> None:
+    item = _table_item(title="Vision, Mission and Goals", table_type="form", row_count=4, column_count=2, cells=FORM_CELLS)
+
+    (table,) = _read_tables(pages, _service, item)
+
+    assert (table.kind, table.row_count, table.column_count, table.bordered) == ("form", 4, 2, True)
+    banner = table.cells[0]
+    assert (banner.row, banner.column, banner.column_span, banner.row_span, banner.is_header) == (0, 0, 2, 1, True)
+    goals = next(cell for cell in table.cells if cell.text.startswith("Goals"))
+    assert (goals.row_span, goals.column_span) == (2, 1)
+    assert "\n" in table.cells[-1].text  # line breaks inside a cell are kept
+
+
+def test_merged_cells_become_spans_and_covered_slots_are_not_repeated() -> None:
+    table = ExtractedTable(page=1, cells=[_cell(c) for c in FORM_CELLS], row_count=4, column_count=2, kind="form")
+
+    built = build_table_layouts(DocumentExtraction(tables=[table]), {1: 11})[1][0]
+
+    assert built["table_type"] == "form"
+    rows = built["rows"]
+    assert [len(row["cells"]) for row in rows] == [1, 2, 2, 1]  # banner spans both columns; goals spans two rows
+    banner = rows[0]["cells"][0]
+    assert (banner["rowspan"], banner["colspan"], banner["is_header"], banner["bold"]) == (1, 2, True, True)
+    goals = rows[2]["cells"][0]
+    assert (goals["rowspan"], goals["colspan"]) == (2, 1)
+    assert rows[3]["cells"][0]["column_index"] == 1  # row 3 only has the slot the merged cell does not cover
+    assert built["style"] == {"bordered": True, "border_width": 1, "layout_source": "gemini"}
+    assert built["source"] == "gemini"
+
+
+def _cell(raw: dict[str, Any]) -> ExtractedCell:
+    return ExtractedCell(
+        row=raw["row"],
+        column=raw["column"],
+        text=raw["text"],
+        row_span=raw.get("row_span", 1),
+        column_span=raw.get("column_span", 1),
+        is_header=raw.get("is_header", False),
+    )
+
+
+def test_missing_slots_are_filled_with_blank_cells_so_every_row_is_complete() -> None:
+    table = ExtractedTable(page=1, cells=[ExtractedCell(0, 0, "a"), ExtractedCell(1, 1, "d")], row_count=2, column_count=3)
+
+    built = build_table_layouts(DocumentExtraction(tables=[table]), {1: 1})[1][0]
+
+    assert [[cell["text"] for cell in row["cells"]] for row in built["rows"]] == [["a", "", ""], ["", "d", ""]]
+    assert built["columns"] == [333.33, 333.33, 333.33]
+
+
+def test_an_overlapping_cell_is_dropped_and_the_first_one_wins() -> None:
+    table = ExtractedTable(
+        page=1,
+        cells=[ExtractedCell(0, 0, "wide", column_span=2), ExtractedCell(0, 1, "overlap"), ExtractedCell(1, 0, "x"), ExtractedCell(1, 1, "y")],
+        row_count=2,
+        column_count=2,
+    )
+
+    built = build_table_layouts(DocumentExtraction(tables=[table]), {1: 1})[1][0]
+
+    assert [[cell["text"] for cell in row["cells"]] for row in built["rows"]] == [["wide"], ["x", "y"]]
+
+
+def test_the_grid_grows_to_fit_the_cells_and_spans_are_clipped_by_the_declared_size(pages) -> None:
+    # declared 1x1 but cells reach row 2 / column 1: the grid is at least as large as the cells need
+    item = _table_item(row_count=1, column_count=1, cells=[{"row": 2, "column": 1, "text": "far", "column_span": 2}, {"row": 0, "column": 0, "text": "near"}])
+
+    (table,) = _read_tables(pages, _service, item)
+
+    assert (table.row_count, table.column_count) == (3, 3)
+    built = build_table_layouts(DocumentExtraction(tables=[table]), {1: 1})[1][0]
+    assert [len(row["cells"]) for row in built["rows"]] == [3, 3, 2]
+
+
+def test_relative_widths_and_heights_set_the_columns_and_cell_boxes() -> None:
+    table = ExtractedTable(
+        page=1,
+        cells=[ExtractedCell(0, 0, "label"), ExtractedCell(0, 1, "paragraph"), ExtractedCell(1, 0, "x", column_span=2)],
+        row_count=2,
+        column_count=2,
+        box=[0, 100, 1000, 300],
+        column_widths=[1, 3],
+        row_heights=[3, 1],
+    )
+
+    built = build_table_layouts(DocumentExtraction(tables=[table]), {1: 1})[1][0]
+
+    assert built["columns"] == [250.0, 750.0]
+    assert [row["height"] for row in built["rows"]] == [150.0, 50.0]
+    assert built["rows"][0]["cells"][1]["bbox"] == [250, 100, 1000, 250]
+    assert built["rows"][1]["cells"][0]["bbox"] == [0, 250, 1000, 300]  # a merged cell covers both columns
+
+
+@pytest.mark.parametrize("widths", [[1], [1, 2, 3], [1, 0], [1, -2], ["a", 1], "wide", None])
+def test_unusable_widths_fall_back_to_even_columns(pages, widths) -> None:
+    (table,) = _read_tables(pages, _service, _table_item(column_widths=widths))
+
+    assert table.column_widths is None
+    built = build_table_layouts(DocumentExtraction(tables=[table]), {1: 1})[1][0]
+    assert built["columns"] == [500.0, 500.0]
+
+
+def test_headers_default_to_the_first_row_only_for_conventional_tables_without_flags(pages) -> None:
+    data, form, flagged = _read_tables(
+        pages,
+        _service,
+        _table_item(),
+        _table_item(table_type="form"),
+        _table_item(cells=[{"row": 0, "column": 0, "text": "a"}, {"row": 1, "column": 0, "text": "b", "is_header": True}]),
+    )
+
+    assert [cell.is_header for cell in data.cells] == [True, True, False, False]
+    assert [cell.is_header for cell in form.cells] == [False] * 4
+    assert [cell.is_header for cell in flagged.cells] == [False, True]  # the model's own flags win
+
+
+def test_table_kind_and_borders_are_read_with_safe_defaults(pages) -> None:
+    unknown, upper, borderless = _read_tables(
+        pages, _service, _table_item(table_type="spreadsheet"), _table_item(table_type=" FORM "), _table_item(bordered=False)
+    )
+
+    assert (unknown.kind, upper.kind, unknown.bordered) == ("data", "form", True)
+    assert borderless.bordered is False
+    built = build_table_layouts(DocumentExtraction(tables=[borderless]), {1: 1})[1][0]
+    assert built["style"]["bordered"] is False and built["style"]["border_width"] == 0
+
+
+def test_the_older_rows_of_strings_shape_is_still_accepted(pages) -> None:
+    legacy = {"page": 1, "title": "Ok", "rows": [["a", None], ["b", "c"]]}
+
+    (table,) = _read_tables(pages, _service, legacy)
+
+    assert [(c.row, c.column, c.text, c.is_header) for c in table.cells] == [(0, 0, "a", True), (0, 1, "", True), (1, 0, "b", False), (1, 1, "c", False)]
+    assert (table.row_count, table.column_count) == (2, 2)
+
+
+def test_malformed_tables_are_skipped_without_failing_the_page(pages) -> None:
+    bad = [
+        {"page": 1, "rows": "nope"},
+        {"rows": [["a"]]},  # no page
+        _table_item(cells=[]),
+        _table_item(cells=["not a cell"]),
+        _table_item(cells=[{"row": -1, "column": 0, "text": "x"}]),
+        _table_item(cells=[{"row": "one", "column": 0, "text": "x"}]),
+        _table_item(cells=[{"row": 0, "column": 0, "text": "x", "row_span": 100000}]),
+        "text",
+    ]
+
+    tables = _read_tables(pages, _service, *bad, _table_item(title="Kept"))
+
+    assert [t.title for t in tables] == ["Kept"]
+
+
+def test_tables_with_no_text_or_on_unknown_pages_produce_no_card() -> None:
+    blank = ExtractedTable.from_rows(1, [["", " "], ["", ""]])
+    elsewhere = ExtractedTable.from_rows(9, [["a", "b"]])
+
+    assert build_table_layouts(DocumentExtraction(tables=[blank, elsewhere]), {1: 1}) == {}
+
+
+def test_each_page_numbers_its_own_tables_and_titles_default_sensibly() -> None:
+    extraction = DocumentExtraction(
+        tables=[
+            ExtractedTable.from_rows(1, [["a", "b"]], title="Named"),
+            ExtractedTable.from_rows(1, [["c", "d"]]),
+            ExtractedTable.from_rows(2, [["e", "f"]]),
+        ]
+    )
+
+    layouts = build_table_layouts(extraction, {1: 11, 2: 12})
+
+    assert [(t["id"], t["title"], t["page_id"]) for t in layouts[1]] == [("page-1-table-1", "Named", 11), ("page-1-table-2", "Table 2", 11)]
+    assert layouts[2][0]["id"] == "page-2-table-1"
+
+
+# ---------------------------------------------------------------------------
+# table contents are not repeated as independent text fields
+# ---------------------------------------------------------------------------
+
+def _grounded(*attributes, tables):
+    texts = " ".join(a.value for a in attributes)
+    return DocumentExtraction(document_type="Syllabus", page_text={1: texts, 2: texts}, attributes=list(attributes), tables=tables)
+
+
+def test_an_attribute_that_sits_inside_a_table_cell_stays_in_the_table() -> None:
+    table = ExtractedTable.from_rows(1, [["Course Code: CSC 106", "SOFTWARE ENGINEERING 1"]], kind="form")
+    extraction = _grounded(
+        ExtractedAttribute("Course Code", "CSC 106", 0.99, 1),
+        ExtractedAttribute("Descriptive Title", "Software Engineering 1", 0.99, 1),
+        ExtractedAttribute("Prepared By", "Department Chair", 0.99, 1),
+        tables=[table],
+    )
+
+    labels = [p["entity_type_label"] for p in build_attribute_payloads(extraction, {1: 1, 2: 2}, 1)]
+
+    assert labels == ["Prepared By"]
+
+
+def test_short_values_other_pages_and_regions_outside_the_table_are_kept() -> None:
+    table = ExtractedTable.from_rows(1, [["Total units: 3", "Course Code: CSC 106"]], kind="form", box=[100, 100, 900, 300])
+    extraction = _grounded(
+        ExtractedAttribute("Units", "3", 0.99, 1),  # too short to match safely
+        ExtractedAttribute("Course Code", "CSC 106", 0.99, 2),  # same text, but a different page
+        ExtractedAttribute("Reference", "CSC 106", 0.99, 1, box=[100, 600, 300, 700]),  # located below the table
+        ExtractedAttribute("Inside", "CSC 106", 0.99, 1, box=[150, 150, 400, 250]),  # located inside the table
+        tables=[table],
+    )
+
+    labels = [p["entity_type_label"] for p in build_attribute_payloads(extraction, {1: 1, 2: 2}, 1)]
+
+    assert labels == ["Units", "Course Code", "Reference"]
+
+
+def test_without_tables_attributes_are_unaffected() -> None:
+    extraction = _grounded(ExtractedAttribute("Course Code", "CSC 106", 0.99, 1), tables=[])
+
+    assert len(build_attribute_payloads(extraction, {1: 1, 2: 2}, 1)) == 1
+
+
+def test_table_boxes_use_gemini_box_2d_order(pages) -> None:
+    (table,) = _read_tables(pages, _service, _table_item(box_2d=[100, 200, 300, 400]))
+
+    assert table.box == [200, 100, 400, 300]
