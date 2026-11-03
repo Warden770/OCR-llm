@@ -14,6 +14,16 @@ Gemini sometimes refuses to reproduce text it has memorized (finish reason `RECI
 
 If Gemini cannot be reached or returns something unusable (missing or invalid key, rate limit, timeout, blocked or malformed response), the document is marked `FAILED` with a short readable reason, and Retry runs it again. There is no OCR fallback: Tesseract and OpenCV were removed. An answer that cannot be parsed as JSON (usually a very long one that was cut off) is handled like a RECITATION stop: a multi-page request is split in half, and a single page is retried with a shorter answer before the document fails with the page number.
 
+### Long documents
+
+A document is read in requests of up to `GEMINI_PAGES_PER_REQUEST` pages, one after another, and built to survive the failures that long documents run into:
+
+- **Retry resumes.** After every request, what has been read so far is saved to `uploads/<document id>/extraction-checkpoint.json`. If a later request fails (rate limit, outage, timeout), the document is marked `FAILED`, and pressing Retry reads only the pages that are still missing, so a long document does not use up the quota again. The saved reading is used only if the source file, page count, model, prompt and image size are unchanged; anything damaged or out of date is ignored. The file is deleted when the document succeeds. The processing screen shows "N of M pages read" and, after a failure, how many pages Retry will not read again.
+- **Requests shrink to what works.** If a request has to be split (answer too long, unreadable, server error, timeout), later requests for that document start at the smaller size instead of repeating the same failure. A refusal or RECITATION on one page does not shrink them.
+- **Page numbers are checked.** Each reply must stay on the pages that were sent: a reply that restarts numbering at 1 is mapped back to the real pages, and anything for a page outside the request is dropped instead of being attached to the wrong page.
+- **Context across requests.** Each request after the first is told how the previous page ended (the last 400 characters of its transcription, marked as context only), so text that runs over a page break can be recognised as a continuation.
+- **Long jobs are not delivered twice.** `CELERY_VISIBILITY_TIMEOUT_SECONDS` (default 6 hours) is how long Redis waits before it would hand the same job to another worker; the Redis default of one hour is too short for very long documents.
+
 ### What is different from word-level OCR
 
 - Gemini's confidence is its own rating, not a measured accuracy like per-word OCR confidence. Treat it as a review signal.

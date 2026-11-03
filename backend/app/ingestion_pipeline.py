@@ -33,9 +33,12 @@ from app.gemini_extractor import (
     GeminiExtractionService,
     build_attribute_payloads,
     build_table_layouts,
+    extraction_from_json,
+    extraction_to_json,
     gemini_is_configured,
     normalize_document_type,
 )
+from app.extraction_checkpoint import CheckpointStore, file_sha256
 from app.models import Attribute, Document as DocumentRecord, Page
 from app.tasks import celery_app
 from app.storage import delete_file, download_file, storage_enabled, upload_file
@@ -217,6 +220,13 @@ def reprocess_document(document_id: int, user_id: CurrentUserId, db: Session = D
     return {"document_id": document.id, "job_id": task_id, "status": "QUEUED"}
 
 
+def _processing_progress(document: DocumentRecord) -> dict[str, int] | None:
+    """``{"pages_read", "total_pages"}`` while a long document is being read, or after a failure that can resume."""
+    if document.status not in {"QUEUED", "PROCESSING", "FAILED"}:
+        return None
+    return CheckpointStore(UPLOAD_ROOT / str(document.id) / "extraction-checkpoint.json").progress()
+
+
 @router.get("/documents/{document_id}")
 def get_document(document_id: int, user_id: CurrentUserId, db: Session = Depends(get_db)) -> dict[str, Any]:
     document = db.query(DocumentRecord).filter(DocumentRecord.id == document_id, owner_scope(DocumentRecord.owner_id, user_id)).first()
@@ -232,6 +242,7 @@ def get_document(document_id: int, user_id: CurrentUserId, db: Session = Depends
         "timestamp": document.timestamp,
         "status": document.status,
         "processing_error": document.processing_error if document.status == "FAILED" else None,
+        "processing_progress": _processing_progress(document),
         "pages": [
             {
                 "id": page.id,
@@ -575,10 +586,35 @@ def process_document_job(document_id: int, source_key: str, original_name: str, 
 
         # Gemini reads the page images before any Page row is written, so no database write lock is held
         # during the (slow) network calls and a cancel request is never blocked.
+        # What has been read is saved after every request, so a Retry after a failure (a rate limit, an outage)
+        # only reads the pages that are still missing instead of starting the whole document again.
+        service = GeminiExtractionService()
+        checkpoint = CheckpointStore(UPLOAD_ROOT / str(document_id) / "extraction-checkpoint.json")
         try:
-            extraction = GeminiExtractionService().extract_document(
+            fingerprint = f"{file_sha256(path)}-{service.settings_fingerprint()}"
+        except OSError:
+            fingerprint = None  # without a fingerprint nothing is saved or reused
+        resume = None
+        if fingerprint is not None:
+            saved = checkpoint.load(fingerprint, len(page_paths))
+            resume = extraction_from_json(saved) if saved is not None else None
+            if resume is not None and resume.read_pages:
+                logger.info(
+                    "Resuming document %s: %d of %d pages were already read",
+                    document_id,
+                    len(resume.read_pages),
+                    len(page_paths),
+                )
+
+        def _save_progress(partial: Any) -> None:
+            checkpoint.save(fingerprint, len(page_paths), extraction_to_json(partial))
+
+        try:
+            extraction = service.extract_document(
                 [(index, page_path) for index, page_path in enumerate(page_paths, start=1)],
                 should_cancel=_is_canceled,
+                resume=resume,
+                on_progress=_save_progress if fingerprint is not None else None,
             )
         except ExtractionCanceled:
             db.rollback()
@@ -677,6 +713,7 @@ def process_document_job(document_id: int, source_key: str, original_name: str, 
         if previous_page_ids:
             db.query(Page).filter(Page.id.in_(previous_page_ids)).delete(synchronize_session=False)
         db.commit()
+        checkpoint.clear()
         _cleanup_artifacts(previous_page_paths, previous_storage_keys)
     except Exception as exc:
         db.rollback()
