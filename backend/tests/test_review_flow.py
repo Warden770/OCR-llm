@@ -53,7 +53,16 @@ def _use_fake_claude(
     """Replace the Claude service so tests never touch the network or need real page images."""
 
     class FakeClaudeService:
-        def extract_document(self, pages: list[tuple[int, Path]], should_cancel: Callable[[], bool] | None = None) -> DocumentExtraction:
+        def settings_fingerprint(self) -> str:
+            return "test-fingerprint"
+
+        def extract_document(
+            self,
+            pages: list[tuple[int, Path]],
+            should_cancel: Callable[[], bool] | None = None,
+            resume: DocumentExtraction | None = None,
+            on_progress: Callable[[DocumentExtraction], None] | None = None,
+        ) -> DocumentExtraction:
             if calls is not None:
                 calls.append(list(pages))
             if error is not None:
@@ -919,7 +928,16 @@ def test_cancel_during_extraction_stops_without_writing_pages(
     page.write_bytes(b"fake-png")
 
     class CancelingService:
-        def extract_document(self, pages: list[tuple[int, Path]], should_cancel: Callable[[], bool] | None = None) -> DocumentExtraction:
+        def settings_fingerprint(self) -> str:
+            return "test-fingerprint"
+
+        def extract_document(
+            self,
+            pages: list[tuple[int, Path]],
+            should_cancel: Callable[[], bool] | None = None,
+            resume: DocumentExtraction | None = None,
+            on_progress: Callable[[DocumentExtraction], None] | None = None,
+        ) -> DocumentExtraction:
             other_session = factory()
             other = other_session.get(Document, document_id)
             assert other is not None
@@ -1045,3 +1063,146 @@ def test_a_continuation_flag_without_a_matching_previous_page_value_stays_separa
     )
 
     assert len(merged) == 2
+
+
+def _resumable_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A two-page document whose first run reads page 1 and then fails, and whose second run succeeds."""
+    factory = _build_session_factory()
+    document_id = _seed_document(factory)
+    uploads = tmp_path / "uploads"
+    source_path = tmp_path / "doc.pdf"
+    source_path.write_bytes(b"%PDF-1.4 original")
+    pages = [tmp_path / "page-1.png", tmp_path / "page-2.png"]
+    for page in pages:
+        page.write_bytes(b"fake-png")
+    resumes: list[DocumentExtraction | None] = []
+    sent_pages: list[list[int]] = []
+
+    class FlakyService:
+        runs = 0
+
+        def settings_fingerprint(self) -> str:
+            return "fp"
+
+        def extract_document(
+            self,
+            pages: list[tuple[int, Path]],
+            should_cancel: Callable[[], bool] | None = None,
+            resume: DocumentExtraction | None = None,
+            on_progress: Callable[[DocumentExtraction], None] | None = None,
+        ) -> DocumentExtraction:
+            FlakyService.runs += 1
+            resumes.append(resume)
+            sent_pages.append([number for number, _ in pages])
+            if FlakyService.runs == 1:
+                assert on_progress is not None
+                on_progress(
+                    DocumentExtraction(
+                        document_type="Syllabus",
+                        page_text={1: "first page"},
+                        attributes=[ExtractedAttribute("Course Code", "CSC 106", 0.9, 1)],
+                        read_pages=[1],
+                    )
+                )
+                raise ClaudeExtractionError("Claude API returned HTTP 503 (service error)")
+            done = resume.read_pages if resume else []
+            return DocumentExtraction(
+                document_type="Syllabus",
+                page_text={**(resume.page_text if resume else {1: "first page"}), 2: "second page"},
+                attributes=[*(resume.attributes if resume else []), ExtractedAttribute("Units", "3", 0.9, 2)],
+                read_pages=sorted({1, 2} | set(done)),
+            )
+
+    monkeypatch.setattr(ingestion_pipeline, "UPLOAD_ROOT", uploads)
+    monkeypatch.setattr(ingestion_pipeline, "SessionLocal", factory)
+    monkeypatch.setattr(ingestion_pipeline, "_rasterize_pdf", lambda path, artifact_id: pages)
+    monkeypatch.setattr(ingestion_pipeline, "upload_file", lambda path, key: None)
+    monkeypatch.setattr(ingestion_pipeline, "ClaudeExtractionService", FlakyService)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    return factory, document_id, source_path, uploads, resumes, sent_pages
+
+
+def _run_job(document_id: int, source_path: Path) -> dict[str, Any]:
+    return ingestion_pipeline.process_document_job(document_id, str(source_path), "doc.pdf", "local-development-user")
+
+
+def _requeue(factory: sessionmaker[Session], document_id: int) -> None:
+    """What the Retry button does: a failed document goes back to the queue."""
+    session = factory()
+    document = session.get(Document, document_id)
+    assert document is not None
+    document.status = "QUEUED"
+    session.commit()
+    session.close()
+
+
+def test_a_failed_long_document_resumes_from_the_pages_already_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory, document_id, source_path, uploads, resumes, sent_pages = _resumable_setup(tmp_path, monkeypatch)
+
+    with pytest.raises(ClaudeExtractionError, match="HTTP 503"):
+        _run_job(document_id, source_path)
+
+    # the status endpoint tells the processing screen how far the document got
+    app.dependency_overrides[get_db] = _override_get_db(factory())
+    try:
+        body = TestClient(app).get(f"/api/v1/documents/{document_id}").json()
+    finally:
+        app.dependency_overrides.clear()
+    assert body["status"] == "FAILED"
+    assert body["processing_error"] == "Claude API returned HTTP 503 (service error)"
+    assert body["processing_progress"] == {"pages_read": 1, "total_pages": 2}
+
+    _requeue(factory, document_id)
+    result = _run_job(document_id, source_path)
+
+    assert result["status"] == "processed"
+    assert resumes[0] is None  # the first run started from scratch
+    assert resumes[1] is not None and resumes[1].read_pages == [1]  # the retry was given what page 1 already produced
+    verify_session = factory()
+    try:
+        document = verify_session.get(Document, document_id)
+        assert document is not None and document.status == "PROCESSED"
+        assert [item["entity_type_label"] for item in document.extracted_attributes] == ["Course Code", "Units"]
+        assert verify_session.query(Page).filter(Page.document_id == document_id).count() == 2
+    finally:
+        verify_session.close()
+    # a finished document keeps no saved reading and reports no progress
+    assert not (uploads / str(document_id) / "extraction-checkpoint.json").exists()
+    app.dependency_overrides[get_db] = _override_get_db(factory())
+    try:
+        assert TestClient(app).get(f"/api/v1/documents/{document_id}").json()["processing_progress"] is None
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_a_saved_reading_is_not_reused_when_the_source_file_changed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory, document_id, source_path, uploads, resumes, sent_pages = _resumable_setup(tmp_path, monkeypatch)
+    with pytest.raises(ClaudeExtractionError):
+        _run_job(document_id, source_path)
+
+    source_path.write_bytes(b"%PDF-1.4 a different file")
+    _requeue(factory, document_id)
+    _run_job(document_id, source_path)
+
+    assert resumes == [None, None]  # nothing from the earlier reading was trusted
+
+
+def test_a_damaged_saved_reading_is_ignored_and_the_document_is_read_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory, document_id, source_path, uploads, resumes, sent_pages = _resumable_setup(tmp_path, monkeypatch)
+    with pytest.raises(ClaudeExtractionError):
+        _run_job(document_id, source_path)
+    (uploads / str(document_id) / "extraction-checkpoint.json").write_text("{ not json", encoding="utf-8")
+
+    _requeue(factory, document_id)
+    result = _run_job(document_id, source_path)
+
+    assert result["status"] == "processed" and resumes == [None, None]

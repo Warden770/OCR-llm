@@ -16,6 +16,8 @@ for support), never a request payload, a response body or the key.
 from __future__ import annotations
 
 import base64
+import dataclasses
+import hashlib
 import io
 import json
 import logging
@@ -210,6 +212,8 @@ class DocumentExtraction:
     page_text: Dict[int, str] = field(default_factory=dict)
     attributes: List[ExtractedAttribute] = field(default_factory=list)
     tables: List[ExtractedTable] = field(default_factory=list)
+    # Pages that have been read completely, so an interrupted run can resume without reading them again.
+    read_pages: List[int] = field(default_factory=list)
 
 
 def claude_is_configured() -> bool:
@@ -540,6 +544,122 @@ def _parse_payload(data: Any, sizes: Optional[Dict[int, tuple[int, int]]] = None
 
 
 
+PREVIOUS_PAGE_TAIL_CHARS = 400
+
+
+def _confine_to_chunk(result: DocumentExtraction, numbers: Sequence[int]) -> None:
+    """Keep results on the pages that were actually sent.
+
+    A model sometimes restarts page numbering at 1 for a later request, or names a page from another request. If
+    every page number in the reply is outside this request but fits 1..N, they are positions and are mapped back to
+    the real page numbers; anything else outside the request is dropped (and counted in the log) instead of being
+    attached to the wrong page.
+    """
+    allowed = set(numbers)
+    used = set(result.page_text) | {item.page for item in result.attributes} | {item.page for item in result.tables}
+    outside = used - allowed
+    if not outside:
+        return
+    if not (used & allowed) and used <= set(range(1, len(numbers) + 1)):
+        remap = {position: number for position, number in enumerate(numbers, start=1)}
+        result.page_text = {remap[page]: text for page, text in result.page_text.items()}
+        for attribute in result.attributes:
+            attribute.page = remap[attribute.page]
+        for table in result.tables:
+            table.page = remap[table.page]
+        logger.warning("The reply numbered pages by position; mapped them back to the page numbers that were sent")
+        return
+    kept_attributes = [item for item in result.attributes if item.page in allowed]
+    kept_tables = [item for item in result.tables if item.page in allowed]
+    kept_text = {page: text for page, text in result.page_text.items() if page in allowed}
+    logger.warning(
+        "Dropped %d attribute(s), %d table(s) and %d page text(s) for pages that were not part of the request",
+        len(result.attributes) - len(kept_attributes),
+        len(result.tables) - len(kept_tables),
+        len(result.page_text) - len(kept_text),
+    )
+    result.attributes, result.tables, result.page_text = kept_attributes, kept_tables, kept_text
+
+
+def extraction_to_json(extraction: DocumentExtraction) -> Dict[str, Any]:
+    """Everything read so far as plain JSON, so an interrupted run can be resumed."""
+    data = dataclasses.asdict(extraction)
+    data["page_text"] = {str(page): text for page, text in extraction.page_text.items()}
+    data["read_pages"] = sorted(set(extraction.read_pages))
+    return data
+
+
+def _saved_box(raw: Any) -> Optional[List[int]]:
+    if isinstance(raw, list) and len(raw) == 4 and all(isinstance(v, int) and not isinstance(v, bool) for v in raw):
+        return list(raw)
+    return None
+
+
+def _saved_weights(raw: Any) -> Optional[List[float]]:
+    if isinstance(raw, list) and raw and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in raw):
+        return [float(v) for v in raw]
+    return None
+
+
+def extraction_from_json(data: Any) -> Optional[DocumentExtraction]:
+    """Rebuild a saved extraction; ``None`` when anything is off, so a damaged checkpoint is ignored, not trusted."""
+    try:
+        if not isinstance(data, dict):
+            return None
+        result = DocumentExtraction(document_type=str(data["document_type"]))
+        result.page_text = {int(page): str(text) for page, text in data["page_text"].items()}
+        result.read_pages = sorted({int(page) for page in data["read_pages"]})
+        for raw in data["attributes"]:
+            result.attributes.append(
+                ExtractedAttribute(
+                    label=str(raw["label"]),
+                    value=str(raw["value"]),
+                    confidence=float(raw["confidence"]),
+                    page=int(raw["page"]),
+                    box=_saved_box(raw.get("box")),
+                    continues_from_previous_page=bool(raw.get("continues_from_previous_page", False)),
+                )
+            )
+        for raw in data["tables"]:
+            cells = [
+                ExtractedCell(
+                    row=int(cell["row"]),
+                    column=int(cell["column"]),
+                    text=str(cell["text"]),
+                    row_span=max(1, int(cell.get("row_span", 1))),
+                    column_span=max(1, int(cell.get("column_span", 1))),
+                    is_header=bool(cell.get("is_header", False)),
+                )
+                for cell in raw["cells"]
+            ]
+            result.tables.append(
+                ExtractedTable(
+                    page=int(raw["page"]),
+                    cells=cells,
+                    row_count=int(raw["row_count"]),
+                    column_count=int(raw["column_count"]),
+                    title=str(raw.get("title", "")),
+                    kind="form" if raw.get("kind") == "form" else "data",
+                    box=_saved_box(raw.get("box")),
+                    column_widths=_saved_weights(raw.get("column_widths")),
+                    row_heights=_saved_weights(raw.get("row_heights")),
+                    bordered=bool(raw.get("bordered", True)),
+                )
+            )
+        return result
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
+def _only_pages(extraction: DocumentExtraction, pages: set[int]) -> DocumentExtraction:
+    """The part of a saved extraction that belongs to the pages of this document."""
+    extraction.read_pages = [page for page in extraction.read_pages if page in pages]
+    extraction.page_text = {page: text for page, text in extraction.page_text.items() if page in pages}
+    extraction.attributes = [item for item in extraction.attributes if item.page in pages]
+    extraction.tables = [item for item in extraction.tables if item.page in pages]
+    return extraction
+
+
 def _loads_lenient(text: str) -> Any:
     """Parse the model's JSON, tolerating a markdown fence or stray text around the object.
 
@@ -662,6 +782,8 @@ class ClaudeExtractionService:
         self.max_retries = _env_int("CLAUDE_MAX_RETRIES", DEFAULT_MAX_RETRIES, minimum=0)
         self._spacing = 0.0  # extra pause before each request once a rate limit has been hit
         self._requests_sent = 0
+        self._chunk_limit = self.pages_per_request  # shrinks when a request had to be split
+        self._text_by_page: Dict[int, str] = {}  # what each page said, to give the next request some context
         self.max_output_tokens = _env_int("CLAUDE_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS, minimum=1024)
         self.max_request_bytes = _env_int("CLAUDE_MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES, minimum=1_000_000)
 
@@ -671,16 +793,30 @@ class ClaudeExtractionService:
         self,
         pages: Sequence[tuple[int, str | Path]],
         should_cancel: Callable[[], bool] | None = None,
+        resume: DocumentExtraction | None = None,
+        on_progress: Callable[[DocumentExtraction], None] | None = None,
     ) -> DocumentExtraction:
-        """Read every page. Any chunk that still fails after retries fails the whole document."""
+        """Read every page. Any request that still fails after retries fails the whole document.
+
+        ``resume`` carries pages that an earlier attempt already read; they are not sent again. ``on_progress`` is
+        called with everything read so far after each request, so the caller can save it and a retry can resume.
+        """
         api_key = self._api_key or os.getenv("ANTHROPIC_API_KEY", "").strip()
         if not api_key:
             raise ClaudeExtractionError("ANTHROPIC_API_KEY is not set")
         if not pages:
             raise ClaudeExtractionError("The document has no pages to read")
 
+        merged = DocumentExtraction()
+        if resume is not None:
+            merged = _only_pages(resume, {number for number, _ in pages})
+            self._remember(merged)
+        done = set(merged.read_pages)
+
         encoded: List[_EncodedPage] = []
         for number, path in sorted(pages, key=lambda item: item[0]):
+            if number in done:
+                continue
             try:
                 data, width, height = _encode_image(path, self.image_max_edge)
             except Exception as exc:
@@ -689,18 +825,30 @@ class ClaudeExtractionService:
                 _EncodedPage(number=number, data=base64.b64encode(data).decode("ascii"), size=len(data), width=width, height=height)
             )
 
-        merged = DocumentExtraction()
-        first_chunk = True
-        for chunk in self._chunk(encoded):
+        self._chunk_limit = self.pages_per_request
+        pending = encoded
+        requested = False
+        while pending:
+            chunk = self._next_chunk(pending)
+            pending = pending[len(chunk):]
             if should_cancel is not None and should_cancel():
                 raise ExtractionCanceled()
-            if not first_chunk and self.request_delay_seconds > 0:
+            if requested and self.request_delay_seconds > 0:
                 self._sleep(self.request_delay_seconds)
-            result = self._extract_chunk(chunk, api_key, None if first_chunk else merged.document_type, should_cancel)
-            if first_chunk:
+            requested = True
+            result = self._extract_chunk(chunk, api_key, merged.document_type if merged.read_pages else None, should_cancel)
+            if not merged.read_pages:
                 merged.document_type = result.document_type
-                first_chunk = False
             self._absorb(merged, result)
+            merged.read_pages = sorted(set(merged.read_pages) | {page.number for page in chunk})
+            if on_progress is not None:
+                try:
+                    on_progress(merged)
+                except Exception as exc:  # saving progress is a convenience; it must never fail the document
+                    logger.warning("Could not save extraction progress (%s)", type(exc).__name__)
+        # A stable sort keeps the model's own order within a page.
+        merged.attributes.sort(key=lambda item: item.page)
+        merged.tables.sort(key=lambda item: item.page)
         return merged
 
     @staticmethod
@@ -711,23 +859,39 @@ class ClaudeExtractionService:
         target.attributes.extend(part.attributes)
         target.tables.extend(part.tables)
 
+    def _remember(self, result: DocumentExtraction) -> None:
+        for page_number, text in result.page_text.items():
+            if text.strip():
+                self._text_by_page[page_number] = text
+
+    def settings_fingerprint(self) -> str:
+        """Identifies everything that changes what a page's reading looks like; a saved reading is only reused if it matches."""
+        material = json.dumps(
+            {
+                "provider": "claude",
+                "model": self.model,
+                "prompt": system_prompt(self.request_boxes),
+                "schema": _build_response_schema(self.request_boxes),
+                "image_max_edge": self.image_max_edge,
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+
     # -- chunking and requests ---------------------------------------------
 
-    def _chunk(self, pages: List[_EncodedPage]) -> List[List[_EncodedPage]]:
-        chunks: List[List[_EncodedPage]] = []
-        current: List[_EncodedPage] = []
-        current_bytes = 0
-        for page in pages:
+    def _next_chunk(self, pending: List[_EncodedPage]) -> List[_EncodedPage]:
+        """The next pages to send together: at most the current limit, and within the request size budget."""
+        chunk: List[_EncodedPage] = []
+        used = 0
+        for page in pending:
             # base64 inflates the payload by about a third
             page_bytes = int(page.size * 4 / 3)
-            if current and (len(current) >= self.pages_per_request or current_bytes + page_bytes > self.max_request_bytes):
-                chunks.append(current)
-                current, current_bytes = [], 0
-            current.append(page)
-            current_bytes += page_bytes
-        if current:
-            chunks.append(current)
-        return chunks
+            if chunk and (len(chunk) >= self._chunk_limit or used + page_bytes > self.max_request_bytes):
+                break
+            chunk.append(page)
+            used += page_bytes
+        return chunk
 
     def _extract_chunk(
         self,
@@ -736,20 +900,24 @@ class ClaudeExtractionService:
         known_document_type: str | None,
         should_cancel: Callable[[], bool] | None,
     ) -> DocumentExtraction:
+        shrink = False
         try:
-            return self._request_chunk(chunk, api_key, known_document_type)
+            result = self._request_chunk(chunk, api_key, known_document_type)
+            self._remember(result)
+            return result
         except _TruncatedResponse:
             if len(chunk) == 1:
                 raise ClaudeExtractionError(
                     f"Claude ran out of output tokens on page {chunk[0].number}; raise CLAUDE_MAX_OUTPUT_TOKENS"
                 ) from None
             logger.info("Claude response was truncated; splitting %d pages into two requests", len(chunk))
+            shrink = True
         except ClaudeServiceError:
             if len(chunk) == 1:
                 raise
             # Smaller requests mean shorter answers, which fail less often when the service is struggling.
             logger.info("Claude kept returning a server error; splitting %d pages into two requests", len(chunk))
-            return self._split_and_extract(chunk, api_key, known_document_type, should_cancel)
+            shrink = True
         except _RefusalStop:
             if len(chunk) == 1:
                 raise ClaudeExtractionError(
@@ -764,7 +932,8 @@ class ClaudeExtractionService:
                 ) from None
             # A shorter request means a shorter answer, which is less likely to come back garbled.
             logger.info("Claude returned an unreadable answer; splitting %d pages into two requests", len(chunk))
-        return self._split_and_extract(chunk, api_key, known_document_type, should_cancel)
+            shrink = True
+        return self._split_and_extract(chunk, api_key, known_document_type, should_cancel, shrink)
 
     def _split_and_extract(
         self,
@@ -772,7 +941,11 @@ class ClaudeExtractionService:
         api_key: str,
         known_document_type: str | None,
         should_cancel: Callable[[], bool] | None,
+        shrink: bool = False,
     ) -> DocumentExtraction:
+        if shrink:
+            # Later requests for this document start at the size that is likely to work instead of failing again.
+            self._chunk_limit = min(self._chunk_limit, max(1, (len(chunk) + 1) // 2))
         middle = len(chunk) // 2
         first = self._extract_chunk(chunk[:middle], api_key, known_document_type, should_cancel)
         if should_cancel is not None and should_cancel():
@@ -806,6 +979,13 @@ class ClaudeExtractionService:
                 f" These pages continue a document whose type was already identified as \"{known_document_type}\"; "
                 "keep attribute names consistent with that kind of document."
             )
+        previous_page = chunk[0].number - 1
+        tail = self._text_by_page.get(previous_page, "").strip()[-PREVIOUS_PAGE_TAIL_CHARS:]
+        if tail:
+            task += (
+                f" For context only, and not to be extracted: page {previous_page} ended with the text between the "
+                f"markers.\n<previous_page_end>\n{tail}\n</previous_page_end>"
+            )
         content.append({"type": "text", "text": task})
         # No temperature or tool_choice: newer Claude models reject forced tool use and fixed sampling settings.
         return {
@@ -820,11 +1000,13 @@ class ClaudeExtractionService:
         self, chunk: List[_EncodedPage], api_key: str, known_document_type: str | None
     ) -> DocumentExtraction:
         payload = self._build_payload(chunk, known_document_type)
-        response = self._send(payload, api_key)
+        response = self._send(payload, api_key, len(chunk))
         sizes = {page.number: (page.width, page.height) for page in chunk}
-        return self._read_response(response, sizes)
+        result = self._read_response(response, sizes)
+        _confine_to_chunk(result, [page.number for page in chunk])
+        return result
 
-    def _send(self, payload: Dict[str, Any], api_key: str) -> Any:
+    def _send(self, payload: Dict[str, Any], api_key: str, pages: int = 1) -> Any:
         headers = {
             "x-api-key": api_key,
             "anthropic-version": ANTHROPIC_VERSION,
@@ -841,6 +1023,9 @@ class ClaudeExtractionService:
             except ClaudeExtractionError:
                 raise
             except Exception as exc:
+                if pages > 1 and "timeout" in type(exc).__name__.lower():
+                    # A bigger request takes longer to answer; smaller ones are more likely to finish in time.
+                    raise ClaudeServiceError(f"Claude request failed: {type(exc).__name__}") from None
                 if not transport_retried:
                     transport_retried = True
                     self._sleep(self._backoff(0))

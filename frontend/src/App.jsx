@@ -3295,7 +3295,12 @@ export default function App() {
         if (normalized === 'QUEUED') {
           setActivity('Queued for extraction...')
         } else if (normalized === 'PROCESSING') {
-          setActivity('Reading the document with Claude...')
+          const progress = result.processing_progress
+          setActivity(
+            progress?.total_pages
+              ? `Reading the document with Claude... ${progress.pages_read} of ${progress.total_pages} pages read`
+              : 'Reading the document with Claude...',
+          )
         }
         if (normalized === 'PROCESSED') {
           setProcessingProgress(100)
@@ -3314,10 +3319,14 @@ export default function App() {
         if (normalized === 'FAILED') {
           setProcessingProgress(100)
           setActivity('Processing failed')
+          const failedProgress = result.processing_progress
+          const resumeNote = failedProgress?.pages_read
+            ? ` ${failedProgress.pages_read} of ${failedProgress.total_pages} pages were already read and will not be read again when you press Retry.`
+            : ''
           setProcessingError(
-            result.processing_error
+            (result.processing_error
               ? `Document processing failed: ${result.processing_error}`
-              : 'Document processing failed. Please try again or upload a different file.',
+              : 'Document processing failed. Please try again or upload a different file.') + resumeNote,
           )
           return
         }

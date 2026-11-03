@@ -24,6 +24,8 @@ from app.claude_extractor import (
     _encode_image,
     build_attribute_payloads,
     build_table_layouts,
+    extraction_from_json,
+    extraction_to_json,
     normalize_document_type,
 )
 
@@ -279,7 +281,6 @@ def test_regions_are_only_requested_when_enabled_and_pixels_are_scaled_to_the_pa
         _attribute("E", "5", box=[1, 2, 3]),  # wrong length
         _attribute("F", "6", box=["a", 1, 2, 3]),
         _attribute("G", "7"),
-        _attribute("H", "8", page=9, box=[1, 1, 50, 50]),  # page we did not send
     ]
     transport = FakeTransport(_response(_payload(attributes=attributes)))
     service, _ = _service(transport, request_boxes=True)
@@ -292,7 +293,7 @@ def test_regions_are_only_requested_when_enabled_and_pixels_are_scaled_to_the_pa
     assert _content(call)[0]["text"] == "Page 1 (image is 200 x 100 pixels):"
     assert "pixels" in call["payload"]["system"]
     assert [a.box for a in result.attributes] == [
-        [100, 100, 500, 500], [0, 0, 1000, 1000], [100, 100, 500, 500], None, None, None, None, None,
+        [100, 100, 500, 500], [0, 0, 1000, 1000], [100, 100, 500, 500], None, None, None, None,
     ]
 
 
@@ -1144,3 +1145,302 @@ def test_without_tables_attributes_are_unaffected() -> None:
     extraction = _grounded(ExtractedAttribute("Course Code", "CSC 106", 0.99, 1), tables=[])
 
     assert len(build_attribute_payloads(extraction, {1: 1, 2: 2}, 1)) == 1
+
+
+# ---------------------------------------------------------------------------
+# long documents: resume, progress, adaptive request size, page numbers, context
+# ---------------------------------------------------------------------------
+
+def _truncated():
+    return _response(stop_reason="max_tokens", payload={})
+
+
+def _refused():
+    return _response(stop_reason="refusal", payload={})
+
+
+def _task(call) -> str:
+    return _content(call)[-1]["text"]
+
+
+def _pages_reply(numbers, label_prefix="Attr", doc_type="Syllabus", text_suffix=""):
+    return _response(
+        _payload(
+            doc_type,
+            [{"page": n, "text": f"text of page {n}{text_suffix}"} for n in numbers],
+            [_attribute(f"{label_prefix} {n}", f"value {n}", page=n) for n in numbers],
+        )
+    )
+
+
+def _saved(*numbers, doc_type="Syllabus") -> DocumentExtraction:
+    return DocumentExtraction(
+        document_type=doc_type,
+        page_text={n: f"text of page {n}" for n in numbers},
+        attributes=[ExtractedAttribute(f"Saved {n}", f"saved {n}", 0.9, n) for n in numbers],
+        read_pages=list(numbers),
+    )
+
+
+def test_a_resumed_run_only_sends_the_pages_that_were_not_read(pages) -> None:
+    transport = FakeTransport(_pages_reply([3, 4, 5, 6]))
+    service, _ = _service(transport)
+
+    result = service.extract_document(pages(6), resume=_saved(1, 2))
+
+    assert [_page_labels(call) for call in transport.calls] == [["Page 3", "Page 4", "Page 5", "Page 6"]]
+    assert 'identified as "Syllabus"' in _task(transport.calls[0])  # the earlier reading's document type carries on
+    assert result.read_pages == [1, 2, 3, 4, 5, 6]
+    assert [a.page for a in result.attributes] == [1, 2, 3, 4, 5, 6]  # in page order
+    assert result.document_type == "Syllabus"
+    assert sorted(result.page_text) == [1, 2, 3, 4, 5, 6]
+
+
+def test_a_resumed_run_with_everything_read_sends_nothing(pages) -> None:
+    transport = FakeTransport(_pages_reply([1]))
+    service, _ = _service(transport)
+
+    result = service.extract_document(pages(2), resume=_saved(1, 2, doc_type="Invoice"))
+
+    assert transport.calls == []
+    assert (result.document_type, result.read_pages) == ("Invoice", [1, 2])
+
+
+def test_saved_pages_that_are_not_part_of_this_document_are_ignored(pages) -> None:
+    transport = FakeTransport(_pages_reply([2]))
+    service, _ = _service(transport)
+
+    result = service.extract_document(pages(2), resume=_saved(1, 9))
+
+    assert [_page_labels(call) for call in transport.calls] == [["Page 2"]]
+    assert result.read_pages == [1, 2]
+    assert 9 not in result.page_text and all(a.page in (1, 2) for a in result.attributes)
+
+
+def test_progress_is_reported_after_every_request_and_survives_a_later_failure(pages) -> None:
+    snapshots: list[list[int]] = []
+    transport = FakeTransport(_pages_reply([1, 2]), _pages_reply([3, 4]), _response(status=403))
+    service, _ = _service(transport, pages_per_request=2)
+
+    with pytest.raises(ClaudeExtractionError, match="HTTP 403"):
+        service.extract_document(pages(6), on_progress=lambda partial: snapshots.append(list(partial.read_pages)))
+
+    assert snapshots == [[1, 2], [1, 2, 3, 4]]  # what was read before the failure was reported, so a retry can resume
+
+
+def test_a_progress_callback_that_fails_never_fails_the_document(pages) -> None:
+    def broken(partial):
+        raise OSError("disk full")
+
+    service, _ = _service(FakeTransport(_pages_reply([1, 2])))
+
+    assert service.extract_document(pages(2), on_progress=broken).read_pages == [1, 2]
+
+
+def test_a_split_shrinks_later_requests_instead_of_repeating_the_failure(pages) -> None:
+    transport = FakeTransport(
+        _truncated(),  # pages 1-6 do not fit in one answer
+        _pages_reply([1, 2, 3]),
+        _pages_reply([4, 5, 6]),
+        _pages_reply([7, 8, 9]),
+        _pages_reply([10, 11, 12]),
+    )
+    service, _ = _service(transport)
+
+    result = service.extract_document(pages(12))
+
+    assert [_page_labels(call) for call in transport.calls] == [
+        ["Page 1", "Page 2", "Page 3", "Page 4", "Page 5", "Page 6"],
+        ["Page 1", "Page 2", "Page 3"],
+        ["Page 4", "Page 5", "Page 6"],
+        ["Page 7", "Page 8", "Page 9"],  # not 6 pages again
+        ["Page 10", "Page 11", "Page 12"],
+    ]
+    assert result.read_pages == list(range(1, 13))
+
+
+def test_a_refusal_split_does_not_shrink_later_requests(pages) -> None:
+    transport = FakeTransport(
+        _refused(),
+        _pages_reply([1, 2, 3]),
+        _pages_reply([4, 5, 6]),
+        _pages_reply([7, 8, 9, 10, 11, 12]),
+    )
+    service, _ = _service(transport)
+
+    service.extract_document(pages(12))
+
+    # one bad page is a problem with that page, not with the size of the requests
+    assert [len(_page_labels(call)) for call in transport.calls] == [6, 3, 3, 6]
+
+
+def test_a_timeout_on_a_multi_page_request_splits_it_instead_of_retrying_at_full_size(pages) -> None:
+    class ReadTimeout(Exception):
+        pass
+
+    transport = FakeTransport(ReadTimeout("slow"), _pages_reply([1, 2]), _pages_reply([3, 4]))
+    service, sleeps = _service(transport)
+
+    result = service.extract_document(pages(4))
+
+    assert [_page_labels(call) for call in transport.calls] == [["Page 1", "Page 2", "Page 3", "Page 4"], ["Page 1", "Page 2"], ["Page 3", "Page 4"]]
+    assert sleeps == []  # no wasted wait before the split
+    assert result.read_pages == [1, 2, 3, 4]
+
+
+def test_a_reply_that_numbers_pages_by_position_is_mapped_back_to_the_real_pages(pages) -> None:
+    transport = FakeTransport(_pages_reply([1]), _response(_payload("Syllabus", [{"page": 1, "text": "second"}], [_attribute("Second", "x", page=1)])))
+    service, _ = _service(transport, pages_per_request=1)
+
+    result = service.extract_document(pages(2))
+
+    assert [(a.label, a.page) for a in result.attributes] == [("Attr 1", 1), ("Second", 2)]
+    assert result.page_text == {1: "text of page 1", 2: "second"}
+
+
+def test_results_for_pages_that_were_not_part_of_the_request_are_dropped(pages) -> None:
+    reply = _response(
+        _payload(
+            "Syllabus",
+            [{"page": 1, "text": "one"}, {"page": 7, "text": "elsewhere"}],
+            [_attribute("Kept", "a", page=1), _attribute("Stray", "b", page=7)],
+            tables=[_table_item(page=7)],
+        )
+    )
+    service, _ = _service(FakeTransport(reply))
+
+    result = service.extract_document(pages(2))
+
+    assert [a.label for a in result.attributes] == ["Kept"]
+    assert result.tables == [] and 7 not in result.page_text
+
+
+def test_the_next_request_is_told_how_the_previous_page_ended(pages) -> None:
+    long_text = "START-OF-PAGE " + ("x" * 800) + " ...and then the sentence continues"
+    transport = FakeTransport(
+        _response(_payload("Syllabus", [{"page": 1, "text": long_text}], [])),
+        _response(_payload("Syllabus", [{"page": 2, "text": "tail"}], [])),
+    )
+    service, _ = _service(transport, pages_per_request=1)
+
+    service.extract_document(pages(2))
+
+    first, second = (_task(call) for call in transport.calls)
+    assert "<previous_page_end>" not in first
+    assert "page 1 ended with" in second and "<previous_page_end>" in second
+    assert second.rstrip().endswith("and then the sentence continues\n</previous_page_end>")
+    assert "START-OF-PAGE" not in second  # only the last few hundred characters are passed on
+
+
+def test_a_saved_reading_survives_a_round_trip_through_json(pages) -> None:
+    table = ExtractedTable(
+        page=2,
+        cells=[ExtractedCell(0, 0, "Label", is_header=True), ExtractedCell(0, 1, "x", column_span=2, row_span=2)],
+        row_count=2,
+        column_count=3,
+        title="Form",
+        kind="form",
+        box=[1, 2, 3, 4],
+        column_widths=[1.0, 2.0, 3.0],
+        row_heights=[1.0, 1.0],
+        bordered=False,
+    )
+    original = DocumentExtraction(
+        document_type="Syllabus",
+        page_text={1: "one", 2: "two\nlines"},
+        attributes=[ExtractedAttribute("A", "1", 0.9, 1, box=[1, 2, 3, 4], continues_from_previous_page=True)],
+        tables=[table],
+        read_pages=[2, 1, 1],
+    )
+
+    restored = extraction_from_json(json.loads(json.dumps(extraction_to_json(original))))
+
+    original.read_pages = [1, 2]  # saved sorted and de-duplicated
+    assert restored == original
+
+
+def _drop(data, key):
+    data.pop(key)
+    return data
+
+
+def _set(data, **changes):
+    data.update(changes)
+    return data
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda d: None,
+        lambda d: [],
+        lambda d: _drop(d, "document_type"),
+        lambda d: _drop(d, "read_pages"),
+        lambda d: _set(d, read_pages=["x"]),
+        lambda d: _set(d, page_text=[1]),
+        lambda d: _set(d, attributes=[{"label": "A"}]),
+        lambda d: _set(d, attributes=[{"label": "A", "value": "v", "confidence": "high", "page": 1}]),
+        lambda d: _set(d, tables=[{"page": 1}]),
+        lambda d: _set(d, tables="nope"),
+    ],
+)
+def test_a_damaged_saved_reading_is_ignored(mutate) -> None:
+    good = extraction_to_json(
+        DocumentExtraction(
+            document_type="Syllabus",
+            page_text={1: "a"},
+            attributes=[ExtractedAttribute("A", "1", 0.9, 1)],
+            tables=[ExtractedTable.from_rows(1, [["a", "b"]])],
+            read_pages=[1],
+        )
+    )
+    assert extraction_from_json(good) is not None  # the undamaged version is accepted
+
+    assert extraction_from_json(mutate(json.loads(json.dumps(good)))) is None
+
+
+def test_the_settings_fingerprint_tracks_what_changes_a_reading() -> None:
+    base = ClaudeExtractionService(model="m1", api_key="k").settings_fingerprint()
+
+    assert base == ClaudeExtractionService(model="m1", api_key="another-key").settings_fingerprint()  # the key is not part of it
+    assert base != ClaudeExtractionService(model="m2", api_key="k").settings_fingerprint()
+    assert base != ClaudeExtractionService(model="m1", api_key="k", image_max_edge=1024).settings_fingerprint()
+    assert base != ClaudeExtractionService(model="m1", api_key="k", request_boxes=True).settings_fingerprint()
+
+
+def test_an_eleven_page_document_that_fails_midway_is_finished_by_a_retry_without_rereading(pages, tmp_path) -> None:
+    from app.extraction_checkpoint import CheckpointStore
+
+    store = CheckpointStore(tmp_path / "42" / "extraction-checkpoint.json")
+    document_pages = pages(11)
+
+    # First attempt: pages 1-6 are read, then the service keeps failing for the rest.
+    first_transport = FakeTransport(_pages_reply(range(1, 7)), _response(status=503))
+    first_service, _ = _service(first_transport)
+    fingerprint = f"source-hash-{first_service.settings_fingerprint()}"
+
+    def save(partial):
+        store.save(fingerprint, 11, extraction_to_json(partial))
+
+    with pytest.raises(ClaudeExtractionError, match="HTTP 503"):
+        first_service.extract_document(document_pages, on_progress=save)
+
+    assert store.progress() == {"pages_read": 6, "total_pages": 11}  # what the processing screen shows after the failure
+
+    # Retry: a fresh service loads the saved reading and sends only pages 7-11.
+    resume = extraction_from_json(store.load(fingerprint, 11))
+    assert resume is not None and resume.read_pages == [1, 2, 3, 4, 5, 6]
+    second_transport = FakeTransport(_pages_reply(range(7, 12)))
+    second_service, _ = _service(second_transport)
+
+    result = second_service.extract_document(document_pages, resume=resume, on_progress=save)
+
+    assert [_page_labels(call) for call in second_transport.calls] == [[f"Page {n}" for n in range(7, 12)]]
+    assert result.read_pages == list(range(1, 12))
+    assert [a.page for a in result.attributes] == list(range(1, 12))
+    assert sorted(result.page_text) == list(range(1, 12))
+    assert store.progress() == {"pages_read": 11, "total_pages": 11}
+
+    # A change of model (or prompt, or image size) invalidates the saved reading.
+    other = ClaudeExtractionService(model="a-different-model", api_key="k")
+    assert store.load(f"source-hash-{other.settings_fingerprint()}", 11) is None
