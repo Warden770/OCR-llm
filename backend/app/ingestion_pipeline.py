@@ -37,6 +37,7 @@ from app.claude_extractor import (
     extraction_to_json,
     claude_is_configured,
     normalize_document_type,
+    user_facing_reason,
 )
 from app.extraction_checkpoint import CheckpointStore, file_sha256
 from app.models import Attribute, Document as DocumentRecord, Page
@@ -1055,7 +1056,7 @@ def _merge_staged_attributes(attributes: list[dict[str, Any]]) -> list[dict[str,
 
 
 def _failure_reason(exc: BaseException) -> str:
-    """A short reason that is safe to show to the user: no payloads, response bodies or keys."""
+    """A short reason that is safe to show to the user: no payloads, response bodies, keys or provider names."""
     if isinstance(exc, ClaudeExtractionError):
-        return str(exc)[:500]
+        return user_facing_reason(exc)
     return f"Processing failed ({type(exc).__name__})"

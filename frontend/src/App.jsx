@@ -1700,7 +1700,7 @@ function ReconstructedTableCard({
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-[150px] flex-1">
             <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
-              {table.table_type === 'form' ? 'Form-like table' : table.style?.layout_source === 'claude' ? 'Claude table reading' : 'Reconstructed table'}
+              {table.table_type === 'form' ? 'Form-like table' : table.style?.layout_source === 'claude' ? 'Detected table' : 'Reconstructed table'}
               {' · Page '}{table.page_number}
             </p>
             <input
@@ -3315,8 +3315,8 @@ export default function App() {
           const progress = result.processing_progress
           setActivity(
             progress?.total_pages
-              ? `Reading the document with Claude... ${progress.pages_read} of ${progress.total_pages} pages read`
-              : 'Reading the document with Claude...',
+              ? `Reading the document... ${progress.pages_read} of ${progress.total_pages} pages read`
+              : 'Reading the document...',
           )
         }
         if (normalized === 'PROCESSED') {

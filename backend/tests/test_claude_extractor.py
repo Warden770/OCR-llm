@@ -1444,3 +1444,32 @@ def test_an_eleven_page_document_that_fails_midway_is_finished_by_a_retry_withou
     # A change of model (or prompt, or image size) invalidates the saved reading.
     other = ClaudeExtractionService(model="a-different-model", api_key="k")
     assert store.load(f"source-hash-{other.settings_fingerprint()}", 11) is None
+
+
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        ("Claude API returned HTTP 429 (daily quota used up; it resets daily, or use a key or plan with a higher quota)", "right now"),
+        ("Claude API returned HTTP 429 (rate limit or quota exceeded)", "right now"),
+        ("Claude API returned HTTP 503 (Claude service error)", "right now"),
+        ("Claude request failed: ReadTimeout", "right now"),
+        ("Claude response was not valid JSON (page 3)", "right now"),
+        ("Claude API returned HTTP 403 (check ANTHROPIC_API_KEY and model access)", "set up correctly"),
+        ("Claude API returned HTTP 401 (check ANTHROPIC_API_KEY)", "set up correctly"),
+        ("ANTHROPIC_API_KEY is not set", "set up correctly"),
+        ("Claude stopped before finishing (RECITATION)", "different file"),
+        ("Claude declined to read page 2 (refusal)", "different file"),
+        ("The document has no pages to read", "no pages"),
+        ("Page 4 image could not be read (OSError)", "Page 4"),
+    ],
+)
+def test_the_reason_shown_to_the_user_never_names_the_provider_or_the_quota(message: str, expected: str) -> None:
+    from app.claude_extractor import user_facing_reason
+
+    reason = user_facing_reason(ClaudeExtractionError(message))
+
+    assert expected in reason
+    lowered = reason.lower()
+    for word in ("gemini", "claude", "anthropic", "api", "quota", "credit", "http", "key", "429", "403"):
+        assert word not in lowered
+
