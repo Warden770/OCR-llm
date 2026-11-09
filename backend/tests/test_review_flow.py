@@ -812,7 +812,7 @@ def test_gemini_failure_marks_document_failed_with_a_readable_reason(
         document = verify_session.get(Document, document_id)
         assert document is not None
         assert document.status == "FAILED"
-        assert document.processing_error == "Gemini API returned HTTP 401 (check GEMINI_API_KEY)"
+        assert document.processing_error == "The document reading service isn't set up correctly. Please contact the administrator."
         assert document.processing_finished_at is not None
         assert verify_session.query(Page).filter(Page.document_id == document_id).count() == 0
         assert not page.exists()
@@ -823,7 +823,7 @@ def test_gemini_failure_marks_document_failed_with_a_readable_reason(
     try:
         body = TestClient(app).get(f"/api/v1/documents/{document_id}").json()
         assert body["status"] == "FAILED"
-        assert body["processing_error"] == "Gemini API returned HTTP 401 (check GEMINI_API_KEY)"
+        assert body["processing_error"] == "The document reading service isn't set up correctly. Please contact the administrator."
     finally:
         app.dependency_overrides.clear()
 
@@ -881,7 +881,7 @@ def test_missing_api_key_fails_the_document_before_rasterizing(
         document = verify_session.get(Document, document_id)
         assert document is not None
         assert document.status == "FAILED"
-        assert document.processing_error == "GEMINI_API_KEY is not set"
+        assert document.processing_error == "The document reading service isn't set up correctly. Please contact the administrator."
         assert rasterize_calls == []
     finally:
         verify_session.close()
@@ -1152,7 +1152,7 @@ def test_a_failed_long_document_resumes_from_the_pages_already_read(
     finally:
         app.dependency_overrides.clear()
     assert body["status"] == "FAILED"
-    assert body["processing_error"] == "Gemini API returned HTTP 503 (service error)"
+    assert body["processing_error"] == "The document could not be processed right now. Please try again in a little while."
     assert body["processing_progress"] == {"pages_read": 1, "total_pages": 2}
 
     _requeue(factory, document_id)

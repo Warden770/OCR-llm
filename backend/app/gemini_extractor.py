@@ -711,6 +711,32 @@ def _rate_limit_info(response: Any) -> tuple[bool, Optional[float]]:
     return daily, (min(delay, MAX_RATE_LIMIT_WAIT_SECONDS) if delay is not None else None)
 
 
+_RETRY_LATER = "The document could not be processed right now. Please try again in a little while."
+_NOT_AVAILABLE = "The document reading service isn't set up correctly. Please contact the administrator."
+_CANNOT_PROCESS = "This document could not be processed. Please try a different file."
+_SAFE_TO_SHOW = re.compile(r"^(The document has no pages to read|Page \d+ image could not be read)")
+_CONFIG_STATUSES = {400, 401, 403, 404}
+_DECLINED_MARKERS = ("blocked", "declined", "refusal", "recitation", "safety", "prohibited", "output tokens")
+
+
+def user_facing_reason(exc: BaseException) -> str:
+    """A short, provider-neutral reason for the person who uploaded the document.
+
+    The exact cause (status codes, setting names, the model's name) stays in the server log; the screen only says
+    whether to try again later, to ask an administrator, or to use a different file.
+    """
+    text = str(exc)
+    if _SAFE_TO_SHOW.match(text):
+        return text[:500]
+    lowered = text.lower()
+    status = re.search(r"HTTP (\d{3})", text)
+    if "is not set" in lowered or "not installed" in lowered or (status and int(status.group(1)) in _CONFIG_STATUSES):
+        return _NOT_AVAILABLE
+    if any(marker in lowered for marker in _DECLINED_MARKERS):
+        return _CANNOT_PROCESS
+    return _RETRY_LATER
+
+
 _STATUS_HINTS = {
     400: "invalid request or API key",
     401: "check GEMINI_API_KEY",
