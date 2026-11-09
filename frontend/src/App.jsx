@@ -2257,6 +2257,14 @@ function ViewerPage({
     setReviewError('')
   }
 
+  const selectedTableCount = detectedTables.filter((table) => (
+    selectedTableKeys.has(table.id)
+    || (table.rows || []).some((row) => (row.cells || []).some((cell) => selectedCellKeys.has(`${table.id}:${cell.id}`)))
+  )).length
+  const selectedItemCount = reviewAttributes.filter((attribute) => selectedReviewKeys.has(getAttributeKey(attribute))).length
+    + selectedTableCount
+    + textFieldEntries.filter((attribute) => selectedTextFieldKeys.has(getAttributeKey(attribute)) && !selectedReviewKeys.has(getAttributeKey(attribute))).length
+
   const saveSelectedReviewAttributes = async () => {
     const selectedAttributes = reviewAttributes.filter((attribute) => selectedReviewKeys.has(getAttributeKey(attribute)))
     const selectedTableItems = detectedTables.flatMap((table) => {
@@ -2280,7 +2288,7 @@ function ViewerPage({
         draft_value: tableText || table.title || 'Table',
       }]
     })
-    const selectedFieldItems = textFieldEntries.filter((attribute) => selectedTextFieldKeys.has(getAttributeKey(attribute))).map((attribute) => ({
+    const selectedFieldItems = textFieldEntries.filter((attribute) => selectedTextFieldKeys.has(getAttributeKey(attribute)) && !selectedReviewKeys.has(getAttributeKey(attribute))).map((attribute) => ({
       ...attribute,
       temp_id: attribute.temp_id || `field-${attribute.id || Date.now()}`,
       draft_label: attribute.draft_label || attribute.entity_type_label,
@@ -2832,12 +2840,12 @@ function ViewerPage({
             <div className="sticky bottom-0 rounded-[24px] border border-slate-200 bg-white p-4 shadow-sm">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="text-sm text-slate-600">
-                  {selectedReviewKeys.size} selected
+                  {selectedItemCount} selected
                 </div>
                 <button
                   type="button"
                   onClick={saveSelectedReviewAttributes}
-                  disabled={savingSelected || !selectedReviewKeys.size}
+                  disabled={savingSelected || !selectedItemCount}
                   className="rounded-full bg-slate-900 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
                 >
                   {savingSelected ? 'Saving...' : 'Save Selected'}
