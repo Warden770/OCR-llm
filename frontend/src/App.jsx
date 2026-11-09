@@ -638,6 +638,15 @@ function pageTitle(page, documentData) {
   return 'Document Dashboard'
 }
 
+function describeApiError(detail, fallback) {
+  if (typeof detail === 'string' && detail.trim()) return detail
+  if (Array.isArray(detail) && detail.length) {
+    // FastAPI validation errors arrive as a list of {loc, msg} objects.
+    return detail.map((item) => [Array.isArray(item?.loc) ? item.loc.slice(1).join('.') : '', item?.msg].filter(Boolean).join(': ')).join('; ') || fallback
+  }
+  return fallback
+}
+
 function readTableStructure(attribute) {
   if (attribute?.table_structure && typeof attribute.table_structure === 'object') {
     return attribute.table_structure
@@ -2278,7 +2287,7 @@ function ViewerPage({
       draft_value: attribute.draft_value || attribute.extracted_value,
     }))
 
-    const combinedSelection = [...selectedAttributes, ...selectedTableItems, ...selectedCellItems, ...selectedFieldItems]
+    const combinedSelection = [...selectedAttributes, ...selectedTableItems, ...selectedFieldItems]
     if (!combinedSelection.length) {
       setReviewError('Select at least one table or field to save.')
       return
@@ -3904,7 +3913,7 @@ export default function App() {
 
     const result = await response.json()
     if (!response.ok) {
-      throw new Error(result.detail || 'Failed to save selected attributes')
+      throw new Error(describeApiError(result.detail, 'Failed to save selected attributes'))
     }
 
     // Refresh document list
