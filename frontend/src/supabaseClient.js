@@ -50,7 +50,40 @@ export async function authenticatedFetch(input, init = {}) {
   return response
 }
 
+function clearStoredSession() {
+  // supabase-js keeps the login under "sb-<project>-auth-token"; remove it directly if signOut left it behind.
+  try {
+    for (const key of Object.keys(window.localStorage)) {
+      if (/^sb-.*-auth-token/.test(key)) window.localStorage.removeItem(key)
+    }
+  } catch {
+    // storage can be unavailable (private mode); nothing more to clear
+  }
+}
+
 export async function signOut() {
   if (!supabase) return { error: null }
-  return supabase.auth.signOut()
+  let token = null
+  try {
+    token = (await supabase.auth.getSession()).data.session?.access_token || null
+  } catch {
+    token = null
+  }
+  // Clear the stored login first: it needs no network, so signing out cannot hang or fail halfway.
+  try {
+    await supabase.auth.signOut({ scope: 'local' })
+  } catch {
+    // fall through to the manual clean-up below
+  }
+  clearStoredSession()
+  if (token) {
+    // End the session on the server in the background. The person is already signed out on this screen.
+    void window
+      .fetch(`${supabaseUrl}/auth/v1/logout?scope=global`, {
+        method: 'POST',
+        headers: { apikey: supabasePublishableKey, Authorization: `Bearer ${token}` },
+      })
+      .catch(() => {})
+  }
+  return { error: null }
 }
