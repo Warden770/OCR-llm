@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import { renderAsync as renderDocx } from 'docx-preview'
-import { authRequired, authenticatedFetch, getAccessToken, supabase } from './supabaseClient'
+import { authRequired, authenticatedFetch, getAccessToken, signOut, supabase } from './supabaseClient'
 
 const fetch = authenticatedFetch
 
@@ -3083,6 +3083,14 @@ export default function App() {
   }, [])
   const currentUserEmail = session?.user?.email || null
   const createdAt = session?.user?.created_at || null
+  async function handleSignOut() {
+    await signOut()
+    setSession(null)
+    setProfileOpen(false)
+    setProfile(null)
+    setPage('landing')
+  }
+
   async function saveProfileName(name) {
     const response = await fetch(`${apiBaseUrl}/api/v1/profile`, {
       method: 'PUT',
@@ -4068,9 +4076,7 @@ export default function App() {
         initialName={profileName}
         error={profileError}
         onSubmit={saveProfileName}
-        onSignOut={async () => {
-          await supabase.auth.signOut({ scope: 'local' })
-        }}
+        onSignOut={handleSignOut}
       />
     )
   }
@@ -4101,13 +4107,7 @@ export default function App() {
             setProfileOpen(false)
             setPage('library')
           }}
-          onSignOut={async () => {
-            if (!supabase) return
-            await supabase.auth.signOut()
-            setSession(null)
-            setProfileOpen(false)
-            setPage('landing')
-          }}
+          onSignOut={handleSignOut}
         />
         <ProfilePage
           name={profile?.name || profileName || 'Name not set'}
@@ -4154,13 +4154,7 @@ export default function App() {
           setProfileOpen(false)
           setPage('library')
         }}
-        onSignOut={async () => {
-          if (!supabase) return
-          await supabase.auth.signOut()
-          setSession(null)
-          setProfileOpen(false)
-          setPage('landing')
-        }}
+        onSignOut={handleSignOut}
       />
 
       {/* Saved toast */}
