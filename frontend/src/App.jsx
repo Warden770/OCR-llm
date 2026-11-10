@@ -1447,7 +1447,7 @@ function LandingPage({
               )}
 
               {/* Pagination controls for server results */}
-              {serverTotal > 0 ? (
+              {serverTotal > 0 && (searchQuery.trim() || Object.values(filters).some(Boolean)) ? (
                 <div className="mt-4 flex items-center justify-between">
                   <div className="text-sm text-slate-600">Showing {Math.min(page * pageSize, serverTotal)} of {serverTotal}</div>
                   <div className="flex items-center gap-2">
@@ -3056,7 +3056,12 @@ export default function App() {
       if (active) setSessionLoading(false)
     })
     const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
-      setSession(nextSession)
+      // Coming back to the tab re-announces the same login; keep the current session object so nothing reloads.
+      setSession((current) => (
+        current && nextSession && current.user?.id === nextSession.user?.id && current.access_token === nextSession.access_token
+          ? current
+          : nextSession
+      ))
       setSessionLoading(false)
       if (!nextSession) {
         setProfileOpen(false)
@@ -3142,7 +3147,7 @@ export default function App() {
     return () => {
       active = false
     }
-  }, [session, apiBaseUrl, profileReloadKey])
+  }, [session?.user?.id, apiBaseUrl, profileReloadKey])
 
   const initialRoute = useMemo(() => parseInitialRoute(), [])
   const [page, setPage] = useState(initialRoute.page)
@@ -3190,7 +3195,7 @@ export default function App() {
 
   const handleServerResults = (payload) => {
     try {
-      if (payload.loading) {
+      if (payload.loading || !payload.q) {
         latestServerRequestKeyRef.current = payload.requestKey
       }
       const matchesCurrentRequest = payload.requestKey === latestServerRequestKeyRef.current
